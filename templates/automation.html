@@ -15,44 +15,31 @@
         Name
         <input name="name" required value="{{ prefill.name }}" placeholder="e.g. Wednesday Classic CrossFit" />
       </label>
-      <div class="row">
-        <label>
-          Training
-          <select name="class_category" required
-                  hx-get="/automation/time-slots"
-                  hx-trigger="change"
-                  hx-target="#time-slot-select"
-                  hx-swap="outerHTML"
-                  hx-include="closest form">
-            <option value="" disabled {% if not prefill.category %}selected{% endif %}>—</option>
-            {% for cat in categories %}
-              <option value="{{ cat }}" {% if cat == prefill.category %}selected{% endif %}>{{ cat }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>
-          Day
-          <select name="day_of_week" required
-                  hx-get="/automation/time-slots"
-                  hx-trigger="change"
-                  hx-target="#time-slot-select"
-                  hx-swap="outerHTML"
-                  hx-include="closest form">
-            <option value="" disabled {% if prefill.day == "" %}selected{% endif %}>—</option>
-            {% for i, dlabel in days %}
-              <option value="{{ i }}" {% if i == prefill.day %}selected{% endif %}>{{ dlabel }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label class="span-2">
-          Time &amp; location
-          {% set slots = initial_time_slots %}
-          {% set selected = initial_selected %}
-          {% set ready = initial_time_slots | length > 0 %}
-          {% set selectors_complete = (prefill.category and prefill.day != "") %}
-          {% include "_time_slot_select.html" %}
-        </label>
-      </div>
+      <label>
+        Training
+        <select name="class_category" required
+                hx-get="/automation/refresh-form"
+                hx-trigger="change"
+                hx-target="#day-and-time"
+                hx-swap="outerHTML"
+                hx-include="closest form">
+          <option value="" disabled {% if not prefill.category %}selected{% endif %}>— pick a training —</option>
+          {% for cat in categories %}
+            <option value="{{ cat }}" {% if cat == prefill.category %}selected{% endif %}>{{ cat }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% set available_days = day_time.available_days %}
+      {% set selected_day = day_time.selected_day %}
+      {% set training_picked = day_time.training_picked %}
+      {% set slots = day_time.slots %}
+      {% set selected_slot = day_time.selected_slot %}
+      {% set selectors_complete = day_time.selectors_complete %}
+      {% set ready = day_time.ready %}
+      {% set auto_day = day_time.auto_day %}
+      {% set auto_slot = day_time.auto_slot %}
+      {% set all_days = day_time.all_days %}
+      {% include "_automation_day_time.html" %}
       <button type="submit">Add rule</button>
     </form>
   </article>

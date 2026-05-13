@@ -186,6 +186,15 @@ header nav .nav-links a.active {
 .rule-form .row .span-2 { grid-column: span 2; }
 @media (max-width: 640px) { .rule-form .row .span-2 { grid-column: span 1; } }
 
+.day-time-block {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: .75rem;
+  margin-top: .25rem;
+}
+@media (max-width: 640px) { .day-time-block { grid-template-columns: 1fr; } }
+.day-time-block label small { display: block; margin-top: .25rem; font-size: .75rem; }
+
 /* ---------- Common ---------- */
 .muted { color: var(--pico-muted-color); margin: 0; }
 .muted.small { font-size: .75rem; }

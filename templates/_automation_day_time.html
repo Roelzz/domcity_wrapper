@@ -1,0 +1,40 @@
+<div id="day-and-time" class="day-time-block">
+  <label>
+    Day
+    <select name="day_of_week" required
+            hx-get="/automation/refresh-form"
+            hx-trigger="change"
+            hx-target="#day-and-time"
+            hx-swap="outerHTML"
+            hx-include="closest form">
+      <option value="" disabled {% if selected_day == "" %}selected{% endif %}>—</option>
+      {% for i, dlabel in all_days %}
+        {% if not training_picked or i in available_days %}
+          <option value="{{ i }}" {% if i == selected_day %}selected{% endif %}>{{ dlabel }}</option>
+        {% endif %}
+      {% endfor %}
+    </select>
+    {% if auto_day %}<small class="muted">↑ only day this training runs — auto-picked</small>{% endif %}
+    {% if training_picked and not available_days %}<small class="warn">No upcoming classes for this training in next 14 days</small>{% endif %}
+  </label>
+
+  <label class="span-2">
+    Time &amp; location
+    <select name="time_of_day" required id="time-slot-select"{% if not ready %} disabled{% endif %}>
+      {% if not ready %}
+        {% if selectors_complete %}
+          <option value="" disabled selected>— no upcoming classes match —</option>
+        {% else %}
+          <option value="" disabled selected>— pick training &amp; day —</option>
+        {% endif %}
+      {% else %}
+        {% if not selected_slot %}<option value="" disabled selected>— select time &amp; location —</option>{% endif %}
+        {% for loc, t in slots %}
+          {% set v = loc ~ "|" ~ t %}
+          <option value="{{ v }}" {% if v == selected_slot %}selected{% endif %}>{{ t }} · {{ loc }}</option>
+        {% endfor %}
+      {% endif %}
+    </select>
+    {% if auto_slot %}<small class="muted">↑ only slot available — auto-picked</small>{% endif %}
+  </label>
+</div>

@@ -230,17 +230,16 @@ async def automation_page(
         fire = _compute_next_fire_from(classes, r, now)
         next_fires[r.id] = fire.isoformat() if fire else "—"
 
-    initial_slots: list[tuple[str, str]] = []
+    # Compute the cascading day/time block from prefill (or empty)
     selected_slot = ""
-    if prefill_category and prefill_day is not None:
-        initial_slots = sorted({
-            (c.location, c.start.strftime("%H:%M")) for c in classes
-            if c.category.lower() == prefill_category.lower()
-            and c.start.weekday() == int(prefill_day)
-            and c.location
-        }, key=lambda lt: (lt[1], lt[0]))
     if prefill_location and prefill_time:
         selected_slot = f"{prefill_location}{SLOT_SEPARATOR}{prefill_time}"
+    day_time_ctx = _build_day_time_ctx(
+        classes,
+        category=prefill_category or "",
+        dow=prefill_day if prefill_day is not None else None,
+        selected_slot=selected_slot,
+    )
 
     ctx = {
         "active": "automation",
@@ -249,16 +248,54 @@ async def automation_page(
         "next_fires": next_fires,
         "days": list(enumerate(DAYS_LONG)),
         "categories": categories,
-        "initial_time_slots": initial_slots,
-        "initial_selected": selected_slot,
+        "day_time": day_time_ctx,
         "prefill": {
             "name": prefill_name or "",
             "category": prefill_category or "",
-            "day": prefill_day if prefill_day is not None else "",
         },
         "token_warning": _token_warning(),
     }
     return templates.TemplateResponse(request, "automation.html", ctx)
+
+
+def _build_day_time_ctx(classes, category: str, dow, selected_slot: str) -> dict:
+    """Compute the cascading-dropdown context. Auto-narrows the day list to
+    days that have this training, auto-picks if only one. Same for time slot."""
+    available_days: set[int] = set()
+    slots: list[tuple[str, str]] = []
+    auto_day = False
+    auto_slot = False
+    if category:
+        cat = category.lower()
+        available_days = {c.start.weekday() for c in classes if c.category.lower() == cat}
+        # If the currently-picked day isn't valid for this training, clear it
+        if dow is not None and dow not in available_days:
+            dow = None
+        # Auto-pick the day if there's only one
+        if dow is None and len(available_days) == 1:
+            dow = next(iter(available_days))
+            auto_day = True
+        if dow is not None and dow in available_days:
+            slots = sorted({
+                (c.location, c.start.strftime("%H:%M")) for c in classes
+                if c.category.lower() == cat and c.start.weekday() == dow and c.location
+            }, key=lambda lt: (lt[1], lt[0]))
+            if len(slots) == 1 and not selected_slot:
+                loc, t = slots[0]
+                selected_slot = f"{loc}{SLOT_SEPARATOR}{t}"
+                auto_slot = True
+    return {
+        "available_days": available_days,
+        "selected_day": dow if dow is not None else "",
+        "training_picked": bool(category),
+        "slots": slots,
+        "selected_slot": selected_slot,
+        "selectors_complete": bool(category and dow is not None),
+        "ready": bool(slots),
+        "auto_day": auto_day,
+        "auto_slot": auto_slot,
+        "all_days": list(enumerate(DAYS_LONG)),
+    }
 
 
 async def _fetch_classes_for_automation():
@@ -296,32 +333,39 @@ def _compute_next_fire_from(classes, rule: AutomationRule, now):
     return max(fire, now)
 
 
-@app.get("/automation/time-slots", response_class=HTMLResponse)
-async def automation_time_slots(
+@app.get("/automation/refresh-form", response_class=HTMLResponse)
+async def automation_refresh_form(
     request: Request,
     class_category: str = "",
     day_of_week: str = "",
     time_of_day: str = "",
 ):
-    """HTMX partial: returns a <select name=time_of_day> populated with
-    (location, HH:MM) options for the given (training, day) combo."""
+    """HTMX partial: returns the cascading Day + Time-slot block.
+    Triggered when training or day changes. Auto-narrows both selects and
+    auto-picks when only one option exists at each level."""
     try:
-        dow = int(day_of_week) if day_of_week != "" else None
+        dow: int | None = int(day_of_week) if day_of_week != "" else None
     except ValueError:
         dow = None
-    has_all_selectors = bool(class_category and dow is not None)
-    slots: list[tuple[str, str]] = []
-    if has_all_selectors:
-        slots = await _time_slots_for(class_category, dow)
-    return templates.TemplateResponse(
+    classes = await _fetch_classes_for_automation()
+    ctx = _build_day_time_ctx(classes, category=class_category, dow=dow, selected_slot=time_of_day)
+    return templates.TemplateResponse(request, "_automation_day_time.html", ctx)
+
+
+# Backwards-compat shim: the form template used to hit /automation/time-slots
+# directly. Keeping this alias makes a stale cached page degrade gracefully.
+@app.get("/automation/time-slots", response_class=HTMLResponse)
+async def automation_time_slots_compat(
+    request: Request,
+    class_category: str = "",
+    day_of_week: str = "",
+    time_of_day: str = "",
+):
+    return await automation_refresh_form(
         request,
-        "_time_slot_select.html",
-        {
-            "slots": slots,
-            "selected": time_of_day,
-            "ready": bool(slots),
-            "selectors_complete": has_all_selectors,
-        },
+        class_category=class_category,
+        day_of_week=day_of_week,
+        time_of_day=time_of_day,
     )
 
 
