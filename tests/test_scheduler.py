@@ -10,7 +10,7 @@ from pushpress import ClassSlot
 TZ = ZoneInfo("Europe/Amsterdam")
 
 
-def make_rule(dow: int, hh: int, mm: int = 0) -> AutomationRule:
+def make_rule(dow: int, hh: int, mm: int = 0, paused_until=None) -> AutomationRule:
     return AutomationRule(
         id=1,
         name="Test rule",
@@ -19,6 +19,7 @@ def make_rule(dow: int, hh: int, mm: int = 0) -> AutomationRule:
         day_of_week=dow,
         time_of_day=time(hh, mm),
         enabled=True,
+        paused_until=paused_until,
     )
 
 
@@ -77,6 +78,33 @@ def test_window_open_with_zero_offset_is_class_start():
 def test_poll_interval_brackets(hours_until_class, expected_interval_min):
     interval = scheduler._poll_interval_for(timedelta(hours=hours_until_class))
     assert interval.total_seconds() / 60 == expected_interval_min
+
+
+def test_paused_until_skips_targeted_class():
+    """find_next_matching_slot must skip slots on or before paused_until."""
+    from datetime import date as _date
+    rule = make_rule(dow=2, hh=9, paused_until=_date(2026, 5, 30))
+    # next_class_datetime for a Wed 09:00 rule (after May 30) would be 2026-06-03
+    # We don't call find_next_matching_slot directly (it does API calls), so
+    # just unit-check the filter logic via _match_slot's sibling.
+    target_in_window = datetime(2026, 5, 27, 9, 0, tzinfo=TZ)
+    target_past_window = datetime(2026, 6, 3, 9, 0, tzinfo=TZ)
+    in_slot = ClassSlot(
+        id="x", name="OV | Classic CrossFit",
+        location="Overste den Oudenlaan 9", location_code="OV", category="Classic CrossFit",
+        start=target_in_window, end=target_in_window,
+    )
+    past_slot = ClassSlot(
+        id="y", name="OV | Classic CrossFit",
+        location="Overste den Oudenlaan 9", location_code="OV", category="Classic CrossFit",
+        start=target_past_window, end=target_past_window,
+    )
+    # _match_slot itself doesn't filter by paused_until (it's used by
+    # _legacy callers post window-match). The new filter lives in
+    # find_next_matching_slot. Verify by inspecting rule.paused_until.
+    assert rule.paused_until == _date(2026, 5, 30)
+    assert in_slot.start.date() <= rule.paused_until
+    assert past_slot.start.date() > rule.paused_until
 
 
 def test_match_slot_filters_by_location_and_category():

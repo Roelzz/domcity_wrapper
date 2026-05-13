@@ -51,7 +51,7 @@
     {% else %}
       <table>
         <thead>
-          <tr><th>Name</th><th>Class</th><th>When</th><th>Next fire</th><th></th><th></th><th></th></tr>
+          <tr><th>Name</th><th>Class</th><th>When</th><th>Next fire</th><th>Paused until</th><th></th><th></th><th></th></tr>
         </thead>
         <tbody>
           {% for r in rules %}
@@ -60,6 +60,12 @@
               <td><small>{{ r.class_category }}<br><span class="muted">{{ r.location }}</span></small></td>
               <td>{{ day_short[r.day_of_week] }} {{ r.time_of_day.strftime('%H:%M') }}</td>
               <td><small>{{ next_fires.get(r.id, '—') }}</small></td>
+              <td>
+                <form method="post" action="/automation/{{ r.id }}/pause-until" class="pause-until-form" style="display:flex;gap:.25rem;align-items:center;margin:0;">
+                  <input type="date" name="paused_until" value="{{ r.paused_until.isoformat() if r.paused_until else '' }}" style="font-size:.75rem;padding:.1rem .2rem;width:9em;" />
+                  <button class="secondary outline small" title="Skip all classes through this date">↩</button>
+                </form>
+              </td>
               <td>
                 {% if r.enabled %}
                   <form method="post" action="/automation/{{ r.id }}/fire" style="display:inline"

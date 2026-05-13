@@ -1,7 +1,7 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 from pathlib import Path
 
-from sqlmodel import Field, SQLModel, create_engine
+from sqlmodel import Field, Session, SQLModel, create_engine, text
 
 from settings import settings
 
@@ -19,6 +19,10 @@ class AutomationRule(SQLModel, table=True):
     day_of_week: int  # 0=Mon ... 6=Sun
     time_of_day: time
     enabled: bool = True
+    # If set, the rule is paused for all classes ON OR BEFORE this date.
+    # Cleared (set to None) to resume. Lets the user skip a holiday without
+    # toggling individual rules manually.
+    paused_until: date | None = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -42,3 +46,16 @@ class TokenCache(SQLModel, table=True):
 
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
+    _ensure_paused_until_column()
+
+
+def _ensure_paused_until_column() -> None:
+    """Lightweight 'migration' for the paused_until column on AutomationRule.
+    SQLite-only; safe to run on every startup. Pre-existing DBs (without the
+    column) get ALTERed; new DBs already have it from create_all."""
+    with Session(engine) as db:
+        cols = db.exec(text("PRAGMA table_info(automationrule)")).all()
+        names = {row[1] for row in cols}
+        if "paused_until" not in names:
+            db.exec(text("ALTER TABLE automationrule ADD COLUMN paused_until DATE"))
+            db.commit()

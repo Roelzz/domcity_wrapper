@@ -402,8 +402,11 @@ def _compute_next_fire_from(classes, rule: AutomationRule, now):
             continue
         if local.hour != rule.time_of_day.hour or local.minute != rule.time_of_day.minute:
             continue
-        if local > now:
-            matches.append(c)
+        if local <= now:
+            continue
+        if rule.paused_until and local.date() <= rule.paused_until:
+            continue
+        matches.append(c)
     if not matches:
         return None
     slot = min(matches, key=lambda c: c.start)
@@ -520,6 +523,26 @@ async def automation_delete(rule_id: int):
         if rule:
             db.delete(rule)
             db.commit()
+    await scheduler.reschedule_all()
+    return RedirectResponse("/automation", status_code=303)
+
+
+@app.post("/automation/{rule_id}/pause-until")
+async def automation_pause_until(rule_id: int, paused_until: str = Form("")):
+    """Set or clear the per-rule pause-until date. Empty string clears."""
+    parsed: date | None = None
+    if paused_until:
+        try:
+            parsed = datetime.fromisoformat(paused_until).date()
+        except ValueError as e:
+            raise HTTPException(400, f"bad date: {e}") from e
+    with DbSession(engine) as db:
+        rule = db.get(AutomationRule, rule_id)
+        if not rule:
+            raise HTTPException(404)
+        rule.paused_until = parsed
+        db.add(rule)
+        db.commit()
     await scheduler.reschedule_all()
     return RedirectResponse("/automation", status_code=303)
 

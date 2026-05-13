@@ -268,14 +268,19 @@ async def find_next_matching_slot(
             continue
         if rule.class_category and s.category.lower() != rule.class_category.lower():
             continue
-        if s.start.astimezone(tz()).weekday() != rule.day_of_week:
+        local = s.start.astimezone(tz())
+        if local.weekday() != rule.day_of_week:
             continue
-        if s.start.astimezone(tz()).time().hour != rule.time_of_day.hour:
+        if local.time().hour != rule.time_of_day.hour:
             continue
-        if s.start.astimezone(tz()).time().minute != rule.time_of_day.minute:
+        if local.time().minute != rule.time_of_day.minute:
             continue
-        if s.start.astimezone(tz()) > after:
-            candidates.append(s)
+        if local <= after:
+            continue
+        # Skip anything on or before the rule's paused_until date.
+        if rule.paused_until and local.date() <= rule.paused_until:
+            continue
+        candidates.append(s)
     candidates.sort(key=lambda s: s.start)
     return (candidates[0] if candidates else None), hint
 
