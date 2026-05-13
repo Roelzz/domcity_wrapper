@@ -93,6 +93,18 @@ _active_token: str = ""
 _active_expiry: datetime | None = None
 _token_lock = asyncio.Lock()
 
+# Anti-storm bookkeeping. Both updated inside _token_lock.
+_last_login_success_at: datetime | None = None  # last time login() returned a fresh token
+_last_login_attempt_at: datetime | None = None  # last time login() was called, success or failure
+
+# A force_refresh that finds a recent successful login (within this window)
+# short-circuits and returns the active token. Prevents concurrent 401s from
+# stampeding the auth endpoint with duplicate logins.
+_RECENT_LOGIN_WINDOW_SEC = 30
+# Any login attempt within this window is treated as "still happening" —
+# back off rather than try again. Survives flaky PushPress auth.
+_LOGIN_COOLDOWN_SEC = 60
+
 
 def _set_active_token(token: str) -> None:
     """Set the in-process token and parse its expiry. Also resets caches that
@@ -164,49 +176,78 @@ async def ensure_token() -> str:
     async with _token_lock:
         if _active_token and _active_expiry and _active_expiry > datetime.now(UTC):
             return _active_token
-        # Try DB cache first
-        from sqlmodel import Session as _Sess
-
-        from models import TokenCache as _TC
-        from models import engine as _engine
-        cached = None
-        with _Sess(_engine) as db:
-            cached = db.get(_TC, 1)
-        if cached:
-            try:
-                exp = datetime.fromtimestamp(
-                    _decode_jwt_payload(cached.access_token)["exp"], tz=UTC
-                )
-            except Exception:
-                exp = None
-            if exp and exp > datetime.now(UTC) + timedelta(minutes=5):
-                _set_active_token(cached.access_token)
-                logger.info("Token loaded from DB cache, expires {}", exp.isoformat())
-                return _active_token
-        # Cache empty or expired -> log in fresh
-        token, expiry = await login(settings.pushpress_email, settings.pushpress_password)
-        _set_active_token(token)
-        # Persist
-        with _Sess(_engine) as db:
-            row = db.get(_TC, 1)
-            if row:
-                row.access_token = token
-                row.expires_at = expiry
-                row.updated_at = datetime.now(UTC).replace(tzinfo=None)
-                db.add(row)
-            else:
-                db.add(_TC(id=1, access_token=token, expires_at=expiry))
-            db.commit()
+        await _refresh_locked(reason="ensure_token (empty or expired)")
         return _active_token
 
 
 async def force_refresh() -> str:
-    """Drop the cache and re-login. Used by the daily cron + on 401 retries."""
-    global _active_token, _active_expiry
+    """Drop the cached token and log in fresh. Holds the lock through the
+    whole operation so concurrent callers see a single login. Short-circuits
+    if a successful login happened within the last _RECENT_LOGIN_WINDOW_SEC
+    seconds (another caller just refreshed for us)."""
     async with _token_lock:
-        _active_token = ""
-        _active_expiry = None
-    return await ensure_token()
+        # Race-protection: did a parallel caller refresh while we were waiting?
+        if _last_login_success_at and (
+            datetime.now(UTC) - _last_login_success_at
+        ).total_seconds() < _RECENT_LOGIN_WINDOW_SEC and _active_token:
+            logger.debug("force_refresh: skipping, fresh login {}s ago",
+                         (datetime.now(UTC) - _last_login_success_at).total_seconds())
+            return _active_token
+        await _refresh_locked(reason="force_refresh")
+        return _active_token
+
+
+async def _refresh_locked(reason: str) -> None:
+    """Refresh the active token. MUST be called while holding _token_lock."""
+    global _last_login_attempt_at, _last_login_success_at
+
+    # Try DB cache first (e.g. a sibling process refreshed it)
+    from sqlmodel import Session as _Sess
+
+    from models import TokenCache as _TC
+    from models import engine as _engine
+    with _Sess(_engine) as db:
+        cached = db.get(_TC, 1)
+    if cached:
+        try:
+            exp = datetime.fromtimestamp(
+                _decode_jwt_payload(cached.access_token)["exp"], tz=UTC
+            )
+        except Exception:
+            exp = None
+        if exp and exp > datetime.now(UTC) + timedelta(minutes=5) and cached.access_token != _active_token:
+            _set_active_token(cached.access_token)
+            logger.info("Token loaded from DB cache ({}), expires {}", reason, exp.isoformat())
+            return
+
+    # Cooldown: don't hammer /auth/login if we recently tried
+    if _last_login_attempt_at and (
+        datetime.now(UTC) - _last_login_attempt_at
+    ).total_seconds() < _LOGIN_COOLDOWN_SEC:
+        # If we still have ANY usable token, just keep using it.
+        if _active_token:
+            logger.warning(
+                "Login cooldown active ({}s remaining) — reusing existing token",
+                _LOGIN_COOLDOWN_SEC - (datetime.now(UTC) - _last_login_attempt_at).total_seconds(),
+            )
+            return
+        # No token at all and cooldown active → still error, but don't pile on the login endpoint
+        raise RuntimeError("login cooldown active, no cached token to fall back on")
+
+    _last_login_attempt_at = datetime.now(UTC)
+    token, expiry = await login(settings.pushpress_email, settings.pushpress_password)
+    _set_active_token(token)
+    _last_login_success_at = datetime.now(UTC)
+    with _Sess(_engine) as db:
+        row = db.get(_TC, 1)
+        if row:
+            row.access_token = token
+            row.expires_at = expiry
+            row.updated_at = datetime.now(UTC).replace(tzinfo=None)
+            db.add(row)
+        else:
+            db.add(_TC(id=1, access_token=token, expires_at=expiry))
+        db.commit()
 
 
 # -------- Client state -------------------------------------------------------
@@ -413,6 +454,13 @@ async def aclose() -> None:
     _client = None
 
 
+def _token_near_expiry() -> bool:
+    """True if the cached token is expired or expires within 5 minutes."""
+    if not _active_expiry:
+        return True
+    return _active_expiry <= datetime.now(UTC) + timedelta(minutes=5)
+
+
 async def _gql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
     token = await ensure_token()
     body = {"operationName": None, "variables": variables, "query": query}
@@ -422,22 +470,35 @@ async def _gql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
         headers={**DEFAULT_HEADERS, "authorization": f"Bearer {token}"},
         json=body,
     )
-    # If the token was revoked or rotated server-side, refresh once and retry.
+    # Conservative 401 recovery: only force a re-login if the cached token
+    # is actually near expiry. A transient 401 with a still-valid token is
+    # treated as a server hiccup — propagate it instead of triggering a
+    # login storm that throws away a perfectly good token.
     if r.status_code in (401, 403):
-        logger.info("PushPress returned {} — refreshing token and retrying", r.status_code)
-        token = await force_refresh()
-        r = await client.post(
-            GRAPHQL_URL,
-            headers={**DEFAULT_HEADERS, "authorization": f"Bearer {token}"},
-            json=body,
-        )
+        if _token_near_expiry():
+            logger.info("PushPress {} + token near expiry — refreshing", r.status_code)
+            token = await force_refresh()
+            r = await client.post(
+                GRAPHQL_URL,
+                headers={**DEFAULT_HEADERS, "authorization": f"Bearer {token}"},
+                json=body,
+            )
+        else:
+            logger.warning(
+                "PushPress {} but token has {}s left — treating as transient",
+                r.status_code,
+                int((_active_expiry - datetime.now(UTC)).total_seconds()) if _active_expiry else -1,
+            )
     if r.status_code != 200:
         raise _GqlError(f"HTTP {r.status_code}: {r.text[:300]}")
     payload = r.json()
     if payload.get("errors"):
         msg = "; ".join(e.get("message", "") for e in payload["errors"])
-        if "Token" in msg or "token" in msg:
-            logger.info("GraphQL token error — refreshing and retrying once")
+        # Only refresh on explicit token errors AND if the cached token
+        # is actually close to expiry. Otherwise propagate the error.
+        token_words = ("token expired", "invalid token", "token is required", "token not provided")
+        if any(w in msg.lower() for w in token_words) and _token_near_expiry():
+            logger.info("GraphQL token error + near expiry — refreshing and retrying once")
             token = await force_refresh()
             r = await client.post(
                 GRAPHQL_URL,
@@ -446,8 +507,7 @@ async def _gql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
             )
             payload = r.json()
             if payload.get("errors"):
-                msg2 = "; ".join(e.get("message", "") for e in payload["errors"])
-                raise _GqlError(msg2)
+                raise _GqlError("; ".join(e.get("message", "") for e in payload["errors"]))
         else:
             raise _GqlError(msg)
     return payload.get("data") or {}

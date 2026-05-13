@@ -37,3 +37,6 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "no_token_mock: opt out of the autouse fake_token fixture that stubs ensure_token/force_refresh",
+]

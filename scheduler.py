@@ -43,16 +43,17 @@ CLASS_FULL_KEYWORDS = (
 )
 
 # Substrings about the USER's account — retrying won't help no matter how long.
+# Kept tight on purpose: a bare "expired" matches "Token expired" (transient!)
+# and a bare "cancelled" matches a gym-cancelled class (handled by the
+# class-vanished branch). Phrases must be specific enough to mean the user.
 USER_TERMINAL_KEYWORDS = (
     "exceeded",
     "registration cap",
-    "already",           # already reserved this class
+    "already reserved",
     "no permission",
     "not authorized",
-    "membership",
-    "subscription",
-    "expired",
-    "cancelled",         # class was cancelled by gym
+    "no active membership",
+    "subscription is not active",
     "not allowed",
 )
 
@@ -105,6 +106,22 @@ def schedule_token_refresh() -> None:
         replace_existing=True,
     )
     logger.info("Token refresh cron scheduled daily at 03:00 {}", settings.tz)
+
+
+def schedule_daily_digest() -> None:
+    """Daily 09:00 cron that flushes the digest buffer. notify.flush_digest()
+    is a no-op when the buffer is empty, so the Telegram only fires on days
+    that actually had something to report."""
+    sch = get_scheduler()
+    sch.add_job(
+        notify.flush_digest,
+        "cron",
+        hour=9,
+        minute=0,
+        id="daily-digest",
+        replace_existing=True,
+    )
+    logger.info("Daily digest cron scheduled at 09:00 {}", settings.tz)
 
 
 def schedule_reminder_scan() -> None:
@@ -208,6 +225,8 @@ async def _active_reservation(reservation_id: str):
 
 
 async def token_refresh_job() -> None:
+    """Daily 03:00 cron. Successful refreshes are logged silently. Failures
+    go to the daily digest, not immediate Telegram."""
     exp = pushpress.token_expiry()
     if not exp:
         logger.warning("Token refresh job: no active token, forcing login")
@@ -215,7 +234,7 @@ async def token_refresh_job() -> None:
             await pushpress.force_refresh()
         except Exception as e:
             logger.error("Token refresh failed: {}", e)
-            await notify.send(f"❌ Domcity Planner: token refresh failed\n{e}")
+            notify.queue_for_digest(f"❌ token refresh failed: {e}")
         return
     days_left = (exp - datetime.now(tz()).astimezone(exp.tzinfo)).days
     if days_left > 7:
@@ -224,10 +243,10 @@ async def token_refresh_job() -> None:
     logger.info("Token has {} days left, refreshing", days_left)
     try:
         await pushpress.force_refresh()
-        await notify.send(f"🔑 Domcity Planner: refreshed PushPress token (was {days_left}d from expiry)")
+        logger.info("Token refreshed (was {}d from expiry)", days_left)
     except Exception as e:
         logger.error("Token refresh failed: {}", e)
-        await notify.send(f"❌ Domcity Planner: token refresh failed\n{e}")
+        notify.queue_for_digest(f"❌ token refresh failed (was {days_left}d from expiry): {e}")
 
 
 def next_class_datetime(rule: AutomationRule, now: datetime | None = None) -> datetime:
@@ -460,8 +479,11 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
 
 async def _start_polling(rule: AutomationRule, slot, label: str, reason: str) -> None:
     _record(rule.id, label, "polling", reason)
-    await notify.send(
-        f"⏳ {rule.name}: class is full, polling for an opening (cadence tightens as class approaches)"
+    # Polling-started is informational — goes to the daily digest, not an
+    # immediate Telegram. The user only needs to know if the poll ends in
+    # a final ✅ or ❌, which still fires immediately.
+    notify.queue_for_digest(
+        f"⏳ {rule.name}: class full at window-open, started polling"
     )
     await _schedule_poll(rule, slot)
 

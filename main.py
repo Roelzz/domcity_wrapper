@@ -12,7 +12,6 @@ from loguru import logger
 from sqlmodel import Session as DbSession
 from sqlmodel import select
 
-import notify
 import pushpress
 import scheduler
 from auth import COOKIE_NAME, AuthMiddleware, make_session_token
@@ -39,6 +38,7 @@ async def lifespan(app: FastAPI):
     await scheduler.reschedule_all()
     scheduler.schedule_token_refresh()
     scheduler.schedule_reminder_scan()
+    scheduler.schedule_daily_digest()
     logger.info("Domcity Planner up on port {}", settings.port)
     yield
     scheduler.shutdown()
@@ -52,8 +52,10 @@ async def _prime_token() -> None:
     try:
         await pushpress.ensure_token()
     except Exception as e:
+        # Silent on Telegram — every container restart would otherwise spam.
+        # If the failure is persistent, the daily refresh cron and any
+        # actual booking attempt will surface the problem via the digest.
         logger.error("Initial token load failed: {}", e)
-        await notify.send(f"❌ Domcity Planner: PushPress login failed at startup\n{e}")
 
 
 app = FastAPI(title="Domcity Planner", lifespan=lifespan)
