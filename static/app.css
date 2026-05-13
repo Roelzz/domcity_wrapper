@@ -268,6 +268,59 @@ button.small, [role=button].small, a.small { padding: .25rem .55rem; font-size: 
 
 .login-wrap { max-width: 420px; margin-top: 8vh; }
 
+/* ---------- Stats ---------- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: .75rem;
+  margin-bottom: 1.5rem;
+}
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+  padding: .9rem;
+  text-align: center;
+}
+.stat-number {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--dc-green-solid);
+}
+.bar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: .5rem;
+  height: 180px;
+  padding: .5rem 0;
+  border-bottom: 1px solid var(--pico-muted-border-color);
+}
+.bar-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: .15rem;
+  min-width: 0;
+}
+.bar {
+  width: 80%;
+  min-height: 2px;
+  background: var(--dc-green-solid);
+  border-radius: 4px 4px 0 0;
+  transition: height 200ms ease;
+}
+.bar-count {
+  font-size: .7rem;
+  font-weight: 600;
+}
+.bar-label {
+  font-size: .65rem;
+  color: var(--pico-muted-color);
+  white-space: nowrap;
+}
+
 @media (max-width: 640px) {
   header nav { flex-direction: column; align-items: flex-start; }
   header nav .nav-links { width: 100%; }

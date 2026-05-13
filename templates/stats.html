@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Stats · Domcity Planner{% endblock %}
+{% block content %}
+<section>
+  <header class="page-head"><h2>Stats</h2></header>
+
+  <div class="stat-grid">
+    <article class="stat-card">
+      <strong class="stat-number">{{ n_success }}</strong>
+      <span class="muted">bookings</span>
+    </article>
+    <article class="stat-card">
+      <strong class="stat-number">{{ "%.0f" | format(success_rate) }}%</strong>
+      <span class="muted">success rate</span>
+    </article>
+    <article class="stat-card">
+      <strong class="stat-number">{{ enabled_count }}/{{ total_rules }}</strong>
+      <span class="muted">active rules</span>
+    </article>
+    <article class="stat-card">
+      <strong class="stat-number">{{ n_failure }}</strong>
+      <span class="muted">failures</span>
+    </article>
+  </div>
+
+  <article>
+    <header><strong>Last 8 weeks — successful bookings</strong></header>
+    <div class="bar-chart">
+      {% for w in weeks %}
+        <div class="bar-col" title="{{ w.label }}: {{ w.count }}">
+          <div class="bar" style="height: {% if max_count %}{{ (w.count / max_count * 100) | round(1) }}{% else %}0{% endif %}%"></div>
+          <span class="bar-count">{{ w.count }}</span>
+          <span class="bar-label">{{ w.label }}</span>
+        </div>
+      {% endfor %}
+    </div>
+  </article>
+
+  <article>
+    <header><strong>By rule</strong></header>
+    {% if not rule_stats %}
+      <p class="muted">No automation rules yet.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>Name</th><th>Class</th><th>Bookings</th><th>Failures</th><th>Last attempt</th></tr></thead>
+        <tbody>
+          {% for s in rule_stats %}
+            <tr>
+              <td><strong>{{ s.rule.name }}</strong></td>
+              <td><small>{{ s.rule.class_category }} <span class="muted">@ {{ s.rule.location }}</span></small></td>
+              <td><span class="success">{{ s.success }}</span></td>
+              <td>{% if s.failure %}<span class="error">{{ s.failure }}</span>{% else %}—{% endif %}</td>
+              <td><small class="muted">{% if s.last_attempt %}{{ s.last_attempt.strftime('%d %b %H:%M') }}{% else %}never{% endif %}</small></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </article>
+
+  <article>
+    <header><strong>By category</strong></header>
+    {% if not categories_sorted %}
+      <p class="muted">No bookings yet.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>Training</th><th>Bookings</th></tr></thead>
+        <tbody>
+          {% for cat, count in categories_sorted %}
+            <tr>
+              <td>{{ cat }}</td>
+              <td><span class="success">{{ count }}</span></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </article>
+
+  {% if n_polling or n_retry %}
+    <p class="muted small">{{ n_polling }} polling sessions · {{ n_retry }} transient retries logged (not counted toward success rate).</p>
+  {% endif %}
+</section>
+{% endblock %}

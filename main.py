@@ -282,6 +282,82 @@ async def cancel_reservation(reservation_id: str):
 
 
 # ---------- Automation ----------
+@app.get("/stats", response_class=HTMLResponse)
+async def stats_page(request: Request):
+    """Read-only dashboard: success rate, weekly timeline, per-rule + per-category."""
+    with DbSession(engine) as db:
+        attempts = db.exec(select(BookingAttempt)).all()
+        rules = db.exec(select(AutomationRule)).all()
+
+    # Overall
+    n_success = sum(1 for a in attempts if a.status == "success")
+    n_failure = sum(1 for a in attempts if a.status == "failure")
+    n_polling = sum(1 for a in attempts if a.status == "polling")
+    n_retry = sum(1 for a in attempts if a.status == "retry")
+    decisive = n_success + n_failure
+    success_rate = (n_success / decisive * 100) if decisive else 0.0
+    enabled_count = sum(1 for r in rules if r.enabled)
+
+    # Weekly timeline — last 8 weeks, successes per week
+    now_local = datetime.now(scheduler.tz())
+    # Anchor on Monday of "this week"
+    this_monday = (now_local.date() - timedelta(days=now_local.weekday()))
+    weeks = []
+    for i in range(8):
+        wk_start = this_monday - timedelta(weeks=7 - i)
+        wk_end = wk_start + timedelta(days=7)
+        count = sum(
+            1 for a in attempts
+            if a.status == "success" and wk_start <= a.fired_at.date() < wk_end
+        )
+        weeks.append({"label": wk_start.strftime("%d %b"), "count": count})
+    max_count = max((w["count"] for w in weeks), default=0)
+
+    # Per rule
+    rule_stats = []
+    for r in rules:
+        rule_attempts = [a for a in attempts if a.rule_id == r.id]
+        succ = sum(1 for a in rule_attempts if a.status == "success")
+        fail = sum(1 for a in rule_attempts if a.status == "failure")
+        last = max((a.fired_at for a in rule_attempts), default=None)
+        rule_stats.append({
+            "rule": r,
+            "success": succ,
+            "failure": fail,
+            "last_attempt": last,
+        })
+    rule_stats.sort(key=lambda x: -x["success"])
+
+    # Per category — successful bookings
+    by_category: dict[str, int] = defaultdict(int)
+    for a in attempts:
+        if a.status != "success":
+            continue
+        # target_class format: "<rule.name> — <Day DD Mon HH:MM>"
+        # Map to category via rule
+        rule = next((r for r in rules if r.id == a.rule_id), None)
+        if rule:
+            by_category[rule.class_category] += 1
+    categories_sorted = sorted(by_category.items(), key=lambda kv: -kv[1])
+
+    ctx = {
+        "active": "stats",
+        "n_success": n_success,
+        "n_failure": n_failure,
+        "n_polling": n_polling,
+        "n_retry": n_retry,
+        "success_rate": success_rate,
+        "total_rules": len(rules),
+        "enabled_count": enabled_count,
+        "weeks": weeks,
+        "max_count": max_count,
+        "rule_stats": rule_stats,
+        "categories_sorted": categories_sorted,
+        "token_warning": _token_warning(),
+    }
+    return templates.TemplateResponse(request, "stats.html", ctx)
+
+
 @app.get("/automation", response_class=HTMLResponse)
 async def automation_page(
     request: Request,

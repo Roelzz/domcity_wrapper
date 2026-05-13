@@ -56,6 +56,15 @@ def test_calendar_ics_with_token():
         assert "END:VCALENDAR" in r.text
 
 
+def test_authed_stats_loads():
+    with TestClient(main.app) as client:
+        client.cookies.set(COOKIE_NAME, make_session_token())
+        r = client.get("/stats")
+        assert r.status_code == 200
+        assert "Stats" in r.text
+        assert "By rule" in r.text
+
+
 def test_schedule_with_filters_in_url():
     with TestClient(main.app) as client:
         client.cookies.set(COOKIE_NAME, make_session_token())
