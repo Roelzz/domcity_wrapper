@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
     logger.info("Domcity Planner up on port {}", settings.port)
     yield
     scheduler.shutdown()
+    await pushpress.aclose()
 
 
 app = FastAPI(title="Domcity Planner", lifespan=lifespan)
@@ -204,20 +205,31 @@ async def automation_page(
         attempts = db.exec(
             select(BookingAttempt).order_by(BookingAttempt.fired_at.desc()).limit(20)
         ).all()
-    locations, categories = await _known_locations_and_categories()
-    next_fires = {}
+
+    # Fetch ONE 14-day window of classes and reuse it for: dropdowns,
+    # initial time slots, and per-rule next-fire times. With caching this is
+    # ~1 round-trip on first call and free thereafter.
+    classes = await _fetch_classes_for_automation()
+    locations = sorted({c.location for c in classes if c.location})
+    categories = sorted({c.category for c in classes if c.category})
+
+    next_fires: dict[int, str] = {}
+    now = datetime.now(scheduler.tz())
     for r in rules:
         if not r.enabled:
             continue
-        try:
-            fire = await scheduler.next_window_open_async(r)
-            next_fires[r.id] = fire.isoformat() if fire else "—"
-        except Exception:
-            next_fires[r.id] = "—"
-    # Pre-compute initial time slots if all three selectors are pre-filled
+        fire = _compute_next_fire_from(classes, r, now)
+        next_fires[r.id] = fire.isoformat() if fire else "—"
+
     initial_slots: list[str] = []
     if prefill_location and prefill_category and prefill_day is not None:
-        initial_slots = await _time_slots_for(prefill_location, prefill_category, int(prefill_day))
+        initial_slots = sorted({
+            c.start.strftime("%H:%M") for c in classes
+            if c.location.lower() == prefill_location.lower()
+            and c.category.lower() == prefill_category.lower()
+            and c.start.weekday() == int(prefill_day)
+        })
+
     ctx = {
         "active": "automation",
         "rules": rules,
@@ -237,6 +249,41 @@ async def automation_page(
         "token_warning": _token_warning(),
     }
     return templates.TemplateResponse(request, "automation.html", ctx)
+
+
+async def _fetch_classes_for_automation():
+    """Single 14-day fetch reused for all automation-page computations."""
+    if not settings.pushpress_token:
+        return []
+    today = datetime.now().date()
+    try:
+        return await pushpress.list_schedule(today, today + timedelta(days=14))
+    except Exception:
+        logger.exception("automation prefetch failed")
+        return []
+
+
+def _compute_next_fire_from(classes, rule: AutomationRule, now):
+    """Look through already-fetched classes for the next match; return when
+    that class's booking window opens (or now if already open)."""
+    matches = []
+    for c in classes:
+        if rule.location and c.location.lower() != rule.location.lower():
+            continue
+        if rule.class_category and c.category.lower() != rule.class_category.lower():
+            continue
+        local = c.start.astimezone(scheduler.tz())
+        if local.weekday() != rule.day_of_week:
+            continue
+        if local.hour != rule.time_of_day.hour or local.minute != rule.time_of_day.minute:
+            continue
+        if local > now:
+            matches.append(c)
+    if not matches:
+        return None
+    slot = min(matches, key=lambda c: c.start)
+    fire = scheduler.window_open_time(slot)
+    return max(fire, now)
 
 
 @app.get("/automation/time-slots", response_class=HTMLResponse)
@@ -425,22 +472,6 @@ async def _time_slots_for(location: str, category: str, day_of_week: int) -> lis
             continue
         seen.add(c.start.strftime("%H:%M"))
     return sorted(seen)
-
-
-async def _known_locations_and_categories() -> tuple[list[str], list[str]]:
-    """Cache one week of schedule data on first request and derive unique
-    locations + categories. Used by the automation form dropdowns."""
-    if not settings.pushpress_token:
-        return [], []
-    today = datetime.now().date()
-    try:
-        items = await pushpress.list_schedule(today, today + timedelta(days=6))
-    except Exception:
-        logger.exception("locations/categories prefetch failed")
-        return [], []
-    locs = sorted({c.location for c in items if c.location})
-    cats = sorted({c.category for c in items if c.category})
-    return locs, cats
 
 
 def _token_warning() -> str | None:

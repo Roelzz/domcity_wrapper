@@ -15,8 +15,10 @@ active subscriptionUuid are fetched once at startup via GetProfiles.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import time as time_mod
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -151,36 +153,92 @@ def _pick_active_subscription(subs: list[dict]) -> dict | None:
 # -------- Public API ---------------------------------------------------------
 
 
-async def list_schedule(start: date, end: date) -> list[ClassSlot]:
-    """Fetch classes in [start, end] (inclusive). Calls per-day to keep query simple."""
-    if not settings.pushpress_token:
-        raise RuntimeError("PUSHPRESS_TOKEN not set")
-    out: list[ClassSlot] = []
-    day = start
-    while day <= end:
-        data = await _gql(_QUERY_CLASSES, {"classDate": day.isoformat()})
+# Per-day schedule cache (TTL 60s). The schedule is read on every page render
+# and barely changes minute-to-minute; this turns repeat hits into in-memory
+# lookups and lets us deduplicate concurrent fetches.
+_SCHEDULE_TTL_SEC = 60
+_schedule_cache: dict[str, tuple[float, list[ClassSlot]]] = {}
+_schedule_locks: dict[str, asyncio.Lock] = {}
+
+# Reservations cache (shorter TTL — these change immediately after a booking).
+_RESERVATIONS_TTL_SEC = 15
+_reservations_cache: tuple[float, list[Reservation]] | None = None
+_reservations_lock = asyncio.Lock()
+
+
+def _now() -> float:
+    return time_mod.monotonic()
+
+
+async def _get_day(day: date) -> list[ClassSlot]:
+    key = day.isoformat()
+    cached = _schedule_cache.get(key)
+    if cached and _now() - cached[0] < _SCHEDULE_TTL_SEC:
+        return cached[1]
+    # Lock per day so concurrent requests for the same day collapse into one.
+    lock = _schedule_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        cached = _schedule_cache.get(key)
+        if cached and _now() - cached[0] < _SCHEDULE_TTL_SEC:
+            return cached[1]
+        data = await _gql(_QUERY_CLASSES, {"classDate": key})
+        slots: list[ClassSlot] = []
         for c in data.get("classes") or []:
             try:
-                out.append(_to_slot(c))
+                slots.append(_to_slot(c))
             except Exception as e:
                 logger.warning("Skip malformed class {}: {}", c.get("uuid"), e)
+        _schedule_cache[key] = (_now(), slots)
+        return slots
+
+
+async def list_schedule(start: date, end: date) -> list[ClassSlot]:
+    """Fetch classes in [start, end] (inclusive). Days fetched in parallel
+    via asyncio.gather and cached in-memory for 60 seconds."""
+    if not settings.pushpress_token:
+        raise RuntimeError("PUSHPRESS_TOKEN not set")
+    days: list[date] = []
+    day = start
+    while day <= end:
+        days.append(day)
         day += timedelta(days=1)
+    results = await asyncio.gather(*[_get_day(d) for d in days])
+    out: list[ClassSlot] = []
+    for chunk in results:
+        out.extend(chunk)
     return out
+
+
+def invalidate_schedule_cache() -> None:
+    """Called after a booking succeeds so subsequent reads pick up the change."""
+    _schedule_cache.clear()
 
 
 async def list_reservations() -> list[Reservation]:
     if not settings.pushpress_token:
         raise RuntimeError("PUSHPRESS_TOKEN not set")
-    data = await _gql(_QUERY_RESERVATIONS, {})
-    out: list[Reservation] = []
-    for r in data.get("reservations") or []:
-        if r.get("isCancelled") or not r.get("isActive"):
-            continue
-        try:
-            out.append(_to_reservation(r))
-        except Exception as e:
-            logger.warning("Skip malformed reservation {}: {}", r.get("uuid"), e)
-    return out
+    global _reservations_cache
+    if _reservations_cache and _now() - _reservations_cache[0] < _RESERVATIONS_TTL_SEC:
+        return _reservations_cache[1]
+    async with _reservations_lock:
+        if _reservations_cache and _now() - _reservations_cache[0] < _RESERVATIONS_TTL_SEC:
+            return _reservations_cache[1]
+        data = await _gql(_QUERY_RESERVATIONS, {})
+        out: list[Reservation] = []
+        for r in data.get("reservations") or []:
+            if r.get("isCancelled") or not r.get("isActive"):
+                continue
+            try:
+                out.append(_to_reservation(r))
+            except Exception as e:
+                logger.warning("Skip malformed reservation {}: {}", r.get("uuid"), e)
+        _reservations_cache = (_now(), out)
+        return out
+
+
+def invalidate_reservations_cache() -> None:
+    global _reservations_cache
+    _reservations_cache = None
 
 
 async def book(calendar_item_uuid: str) -> BookingResult:
@@ -197,6 +255,8 @@ async def book(calendar_item_uuid: str) -> BookingResult:
         data = await _gql(_MUTATION_BOOK, variables)
         uuid = (data.get("createReservation") or {}).get("uuid")
         if uuid:
+            invalidate_reservations_cache()
+            invalidate_schedule_cache()
             return BookingResult(ok=True, reservation_id=uuid, message="booked")
         return BookingResult(ok=False, message="createReservation returned no uuid")
     except _GqlError as e:
@@ -206,7 +266,11 @@ async def book(calendar_item_uuid: str) -> BookingResult:
 async def cancel(reservation_uuid: str) -> bool:
     try:
         data = await _gql(_MUTATION_CANCEL, {"reservationId": reservation_uuid})
-        return bool((data.get("cancelReservation") or {}).get("uuid"))
+        ok = bool((data.get("cancelReservation") or {}).get("uuid"))
+        if ok:
+            invalidate_reservations_cache()
+            invalidate_schedule_cache()
+        return ok
     except _GqlError as e:
         logger.warning("cancel failed: {}", e)
         return False
@@ -219,14 +283,37 @@ class _GqlError(RuntimeError):
     pass
 
 
+# Shared module-level client. Keeps the TLS/HTTP2 connection pool open across
+# requests instead of paying handshake cost on every call. Closed on shutdown.
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            timeout=20,
+            http2=False,  # would need h2 dep — http/1.1 keepalive is plenty here
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+        )
+    return _client
+
+
+async def aclose() -> None:
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+
+
 async def _gql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
     headers = {
         **DEFAULT_HEADERS,
         "authorization": f"Bearer {settings.pushpress_token}",
     }
     body = {"operationName": None, "variables": variables, "query": query}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(GRAPHQL_URL, headers=headers, json=body)
+    client = _get_client()
+    r = await client.post(GRAPHQL_URL, headers=headers, json=body)
     if r.status_code != 200:
         raise _GqlError(f"HTTP {r.status_code}: {r.text[:300]}")
     payload = r.json()
