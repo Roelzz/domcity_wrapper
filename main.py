@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI):
     await _prime_token()
     await scheduler.reschedule_all()
     scheduler.schedule_token_refresh()
+    scheduler.schedule_reminder_scan()
     logger.info("Domcity Planner up on port {}", settings.port)
     yield
     scheduler.shutdown()
@@ -172,6 +173,7 @@ async def book_slot(slot_id: str):
             return HTMLResponse(
                 f'<span class="error">Failed: {result.message}</span>', status_code=400
             )
+        await scheduler.reminder_scan_job()  # schedule reminders for the new booking
         return HTMLResponse('<span class="success">Booked ✓</span>')
     except Exception as e:
         logger.exception("book failed")

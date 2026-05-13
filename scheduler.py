@@ -24,6 +24,9 @@ RETRY_DELAY_SEC = 30
 LOOKAHEAD_DAYS = 14
 POLL_INTERVAL_HOURS = 12        # check twice a day for "class full" rules
 MIN_HOURS_BEFORE_CLASS = 1      # stop polling this close to class start
+REMINDER_SCAN_INTERVAL_MIN = 15 # how often to refresh per-reservation reminders
+REMINDER_DAY_HOUR = 8           # local hour for the same-day reminder
+REMINDER_PRE_MIN = 30           # minutes before class start for the late reminder
 
 # Substrings that mean the SLOT is full but could open up if someone cancels.
 # These rules switch into 12-hour polling mode instead of fast-retrying.
@@ -103,6 +106,104 @@ def schedule_token_refresh() -> None:
         replace_existing=True,
     )
     logger.info("Token refresh cron scheduled daily at 03:00 {}", settings.tz)
+
+
+def schedule_reminder_scan() -> None:
+    """Periodic job that keeps per-reservation reminders up to date."""
+    sch = get_scheduler()
+    sch.add_job(
+        reminder_scan_job,
+        "interval",
+        minutes=REMINDER_SCAN_INTERVAL_MIN,
+        id="reminder-scan",
+        replace_existing=True,
+        next_run_time=datetime.now(tz()) + timedelta(seconds=15),
+    )
+    logger.info("Reminder scan scheduled every {} min", REMINDER_SCAN_INTERVAL_MIN)
+
+
+async def reminder_scan_job() -> None:
+    """Fetch upcoming reservations and (re-)schedule two reminders per booking:
+    one at 08:00 local on the class day and one 30 minutes before class start.
+    Idempotent — job IDs are deterministic + replace_existing."""
+    try:
+        reservations = await pushpress.list_reservations()
+    except Exception as e:
+        logger.warning("Reminder scan: list_reservations failed: {}", e)
+        return
+    sch = get_scheduler()
+    now = datetime.now(tz())
+    scheduled = 0
+    for r in reservations:
+        if not r.cancellable:
+            continue
+        start_local = r.start.astimezone(tz())
+        if start_local <= now:
+            continue
+
+        day_reminder = start_local.replace(
+            hour=REMINDER_DAY_HOUR, minute=0, second=0, microsecond=0
+        )
+        if now < day_reminder < start_local:
+            sch.add_job(
+                reminder_day_job,
+                "date",
+                run_date=day_reminder,
+                args=[r.id],
+                id=f"reminder-{r.id}-day",
+                replace_existing=True,
+                misfire_grace_time=60 * 10,
+            )
+            scheduled += 1
+
+        pre = start_local - timedelta(minutes=REMINDER_PRE_MIN)
+        if pre > now:
+            sch.add_job(
+                reminder_pre_job,
+                "date",
+                run_date=pre,
+                args=[r.id],
+                id=f"reminder-{r.id}-pre",
+                replace_existing=True,
+                misfire_grace_time=60 * 5,
+            )
+            scheduled += 1
+    logger.debug(
+        "Reminder scan: ensured {} reminders across {} reservations",
+        scheduled, len(reservations),
+    )
+
+
+async def reminder_day_job(reservation_id: str) -> None:
+    r = await _active_reservation(reservation_id)
+    if not r:
+        return
+    start_local = r.start.astimezone(tz())
+    msg = f"📅 Today at {start_local.strftime('%H:%M')}: {r.class_name}"
+    if r.instructor:
+        msg += f"\n👤 {r.instructor}"
+    await notify.send(msg)
+
+
+async def reminder_pre_job(reservation_id: str) -> None:
+    r = await _active_reservation(reservation_id)
+    if not r:
+        return
+    start_local = r.start.astimezone(tz())
+    msg = f"⏰ Starts in {REMINDER_PRE_MIN} min ({start_local.strftime('%H:%M')}): {r.class_name}"
+    if r.instructor:
+        msg += f"\n👤 {r.instructor}"
+    await notify.send(msg)
+
+
+async def _active_reservation(reservation_id: str):
+    try:
+        reservations = await pushpress.list_reservations()
+    except Exception:
+        return None
+    return next(
+        (r for r in reservations if r.id == reservation_id and r.cancellable), None
+    )
 
 
 async def token_refresh_job() -> None:
@@ -270,6 +371,9 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
     if result.ok:
         _record(rule.id, target_label, "success", result.message or "booked")
         await notify.send(f"✅ Booked: {target_label}")
+        # Bump the reminder scan so reminders for THIS new reservation land
+        # immediately instead of waiting up to 15 min for the next interval.
+        await reminder_scan_job()
         # Re-schedule for the FOLLOWING week (look past the slot we just booked).
         await _schedule_after(rule, slot.start.astimezone(tz()) + timedelta(minutes=1))
     else:
@@ -333,6 +437,7 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
     if result.ok:
         _record(rule.id, label, "success", "booked from poll")
         await notify.send(f"✅ Booked from poll: {label}")
+        await reminder_scan_job()
         await _schedule_after(rule, class_start + timedelta(minutes=1))
         return
 
