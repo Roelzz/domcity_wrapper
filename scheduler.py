@@ -119,28 +119,23 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
     logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
 
     try:
-        session = await pushpress.login(settings.pushpress_email, settings.pushpress_password)
+        slots = await pushpress.list_schedule(class_dt.date(), class_dt.date())
     except Exception as e:
-        return await _handle_failure(rule, attempt, target_label, f"login failed: {e}")
+        return await _handle_failure(rule, attempt, target_label, f"schedule fetch failed: {e}")
 
+    slot = _match_slot(slots, rule.class_name_pattern, class_dt)
+    if not slot:
+        return await _handle_failure(rule, attempt, target_label, "no matching class slot found")
     try:
-        slots = await pushpress.list_schedule(
-            session, class_dt - timedelta(hours=1), class_dt + timedelta(hours=1)
-        )
-        slot = _match_slot(slots, rule.class_name_pattern, class_dt)
-        if not slot:
-            return await _handle_failure(
-                rule, attempt, target_label, "no matching class slot found"
-            )
-        result = await pushpress.book(session, slot.id)
-        if result.ok:
-            _record(rule.id, target_label, "success", result.message or "booked")
-            await notify.send(f"✅ Booked: {target_label}")
-            schedule_rule(rule)  # next week
-        else:
-            await _handle_failure(rule, attempt, target_label, result.message)
-    finally:
-        await session.aclose()
+        result = await pushpress.book(slot.id)
+    except Exception as e:
+        return await _handle_failure(rule, attempt, target_label, f"book call raised: {e}")
+    if result.ok:
+        _record(rule.id, target_label, "success", result.message or "booked")
+        await notify.send(f"✅ Booked: {target_label}")
+        schedule_rule(rule)  # next week
+    else:
+        await _handle_failure(rule, attempt, target_label, result.message)
 
 
 def _match_slot(slots, pattern: str, when: datetime):

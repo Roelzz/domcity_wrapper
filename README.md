@@ -8,43 +8,44 @@ Built for one gym member, deployed on a home server via Coolify.
 
 - **Schedule** — browse upcoming classes (week navigation, mobile + desktop)
 - **Reservations** — view bookings, cancel
-- **Automation** — recurring rules: "every Monday's 17:00 class, auto-book the moment the booking window opens 24h before". Retries on failure. Telegram notifications.
+- **Automation** — recurring rules: e.g. "every Wednesday's 09:00 Classic CrossFit, auto-book the moment the booking window opens 14 days ahead". Retries on failure. Telegram notifications.
 
 ## Stack
 
 - Python 3.12, UV, Ruff, Pytest
 - FastAPI + Jinja2 + HTMX + Pico.css
-- httpx (PushPress client) · APScheduler (cron) · SQLModel + SQLite · Fernet (creds encryption) · loguru
+- httpx async client → PushPress GraphQL API
+- APScheduler (in-process cron) · SQLModel + SQLite · Fernet · loguru
+
+## How auth works
+
+The members portal is a Flutter SPA backed by GraphQL at `api.pushpress.com/v2/graph/graphql`. Auth is a bearer JWT (HS256, server-signed, ~60-day lifetime). There's no programmatic login — PushPress mints the token after browser form login. To use this app:
+
+1. Log into <https://members.pushpress.com> in Chrome/Edge.
+2. Open DevTools → Network → click any `graphql` request.
+3. In the Headers tab, copy the value of `Authorization` (the long token after `Bearer `).
+4. Paste it into `.env` as `PUSHPRESS_TOKEN=` (without the `Bearer ` prefix).
+5. The app warns you 7 days before expiry (via Telegram + UI banner). Repeat steps 1-4 when prompted.
+
+`clientUuid` and `userUuid` are decoded from the JWT itself. `clientUserUuid` and `subscriptionUuid` are auto-discovered via a `GetProfiles` query at first request.
 
 ## Setup
 
 ```bash
 uv sync
 cp .env.example .env
-# Edit .env, especially:
-#  - APP_PASSWORD          (chosen by you)
-#  - SECRET_KEY            (python -c "import secrets; print(secrets.token_urlsafe(32))")
-#  - FERNET_KEY            (python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-#  - PUSHPRESS_BASE_URL    (your gym's subdomain, e.g. https://yourgym.members.pushpress.com)
-#  - PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD
-#  - TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (optional)
+# Edit .env:
+#   APP_PASSWORD        — your chosen password to unlock the UI
+#   SECRET_KEY          — python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   FERNET_KEY          — python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#   PUSHPRESS_TOKEN     — see "How auth works" above
+#   TELEGRAM_BOT_TOKEN  — optional, for booking-result notifications
+#   TELEGRAM_CHAT_ID    — optional
 
 uv run uvicorn main:app --port 2009
 ```
 
-Open <http://localhost:2009> → password prompt → schedule.
-
-## ⚠️ Required before live use: endpoint discovery
-
-PushPress publishes no member API. `pushpress.py` ships with **speculative endpoint paths and JSON shapes** that almost certainly need to be adjusted to your gym's actual portal.
-
-1. Open Chrome on `members.pushpress.com` (your gym subdomain), open DevTools → Network → enable "Preserve log".
-2. Log in, view schedule, view reservations, book a class, cancel one.
-3. Save all network calls as HAR (`docs/session.har`).
-4. Fill in `docs/endpoints.md` (template: `docs/endpoints.md.example`).
-5. Update the `ENDPOINTS` block and the `_parse_*` functions in `pushpress.py`.
-6. Re-run `uv run pytest` — fixtures should still pass.
-7. Smoke-test against real PushPress.
+Open <http://localhost:2009> → enter `APP_PASSWORD` → schedule.
 
 ## Tests
 
@@ -60,15 +61,14 @@ uv run pytest
 3. Environment variables: copy from `.env.example`, fill in real values.
 4. Expose port `2009`.
 5. Point your proxy/domain at the Coolify app.
-
-Coolify will rebuild on every push. The SQLite DB lives in `./data/` — mount that as a persistent volume in Coolify so rules and attempt history survive redeploys.
+6. Mount a persistent volume at `./data/` so the SQLite DB + automation rules survive redeploys.
 
 ## Project layout
 
 ```
 Domcity/
 ├── main.py              # FastAPI app + routes + lifespan
-├── pushpress.py         # PushPress async client (HTTP)
+├── pushpress.py         # GraphQL client (httpx + JWT)
 ├── scheduler.py         # APScheduler + booking_window_job
 ├── auth.py              # Password gate
 ├── models.py            # SQLModel tables
@@ -78,7 +78,7 @@ Domcity/
 ├── templates/           # Jinja2 (base, login, schedule, reservations, automation)
 ├── static/app.css
 ├── tests/
-├── docs/endpoints.md    # (gitignored) your real endpoint notes
+├── docs/endpoints.md    # (gitignored) your captured endpoint reference
 ├── nixpacks.toml
 ├── Procfile
 ├── pyproject.toml
@@ -87,19 +87,19 @@ Domcity/
 
 ## How the automation works
 
-Each rule encodes "class name pattern", "day of week", "time of day", and "lead time hours" (how far ahead the booking window opens — PushPress default is 24h, priority members 48h).
+Each rule encodes "class name substring", "day of week", "time of day", and "lead time hours" — how far ahead the booking window opens at your gym. PushPress sets this per class type via `registrationStartOffset` (in minutes). This CrossFit gym uses **14 days = 336h** for Classic CrossFit, the default in `.env`.
 
-On startup, the scheduler computes the next moment the window opens for each enabled rule and schedules a one-shot job. The job:
+On startup, the scheduler computes the next moment the window opens for each enabled rule and schedules a one-shot APScheduler job. The job:
 
-1. Logs into PushPress
-2. Finds the matching class slot in the schedule
-3. POSTs the booking
+1. Fetches the schedule for that day
+2. Finds the matching class (substring match + within 30 min of expected time)
+3. POSTs `CreateReservation`
 4. On failure, retries every 30s up to 10 times
 5. Sends a Telegram message with the result
 6. Records a `BookingAttempt` row
 7. Schedules itself for the same time next week
 
-Timing is accurate to APScheduler tolerance (~1s) — usually enough unless your gym holds millisecond-level races.
+Timing is accurate to ~1s — sufficient for a public booking window race.
 
 ## License
 

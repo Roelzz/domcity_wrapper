@@ -1,84 +1,233 @@
-"""Tests against the speculative endpoint shapes. Once a HAR is captured and
-pushpress.py is updated, rewrite these fixtures to match real responses."""
+"""Tests for the GraphQL PushPress client.
 
-from datetime import datetime
+Real shapes captured from a session against api.pushpress.com. Auth is mocked
+with a fake JWT (decoded base64-only, never verified) — the real token is
+HS256-signed by the server and not derivable client-side.
+"""
+
+import base64
+import json
+from datetime import date
 
 import httpx
 import pytest
 import respx
 
 import pushpress
+import settings as settings_module
+
+FAKE_JWT = "header." + base64.urlsafe_b64encode(
+    json.dumps(
+        {
+            "clientUuid": "client_test",
+            "sub": "usr_test",
+            "exp": 9999999999,
+            "iat": 1700000000,
+        }
+    ).encode()
+).rstrip(b"=").decode() + ".sig"
 
 
-@pytest.mark.asyncio
+@pytest.fixture(autouse=True)
+def fake_token(monkeypatch):
+    monkeypatch.setattr(settings_module.settings, "pushpress_token", FAKE_JWT)
+    pushpress._tenant = None  # reset cache between tests
+    yield
+
+
+def test_decode_jwt_extracts_claims():
+    assert pushpress.token_client_uuid() == "client_test"
+    assert pushpress.token_user_uuid() == "usr_test"
+    exp = pushpress.token_expiry()
+    assert exp is not None and exp.year >= 2286  # 9999999999 is year 2286
+
+
 @respx.mock
-async def test_login_extracts_csrf_and_succeeds():
-    base = "https://members.pushpress.com"
-    respx.get(f"{base}/login").mock(
-        return_value=httpx.Response(
-            200, html='<meta name="csrf-token" content="abc123">'
-        )
-    )
-    respx.post(f"{base}/login").mock(
-        return_value=httpx.Response(200, html="<html>dashboard</html>")
-    )
-    session = await pushpress.login("a@b.c", "pw")
-    try:
-        assert session.csrf_token == "abc123"
-    finally:
-        await session.aclose()
-
-
 @pytest.mark.asyncio
-@respx.mock
-async def test_list_schedule_parses_speculative_shape():
-    base = "https://members.pushpress.com"
-    respx.get(f"{base}/login").mock(return_value=httpx.Response(200, html=""))
-    respx.post(f"{base}/login").mock(return_value=httpx.Response(200, html=""))
-    respx.get(f"{base}/api/schedule").mock(
+async def test_list_schedule_parses_real_shape():
+    respx.post(pushpress.GRAPHQL_URL).mock(
         return_value=httpx.Response(
             200,
             json={
-                "classes": [
-                    {
-                        "id": "42",
-                        "name": "Strength",
-                        "start": "2026-05-15T17:00:00",
-                        "end": "2026-05-15T18:00:00",
-                        "instructor": "Coach K",
-                        "spots_available": 3,
-                        "spots_total": 12,
-                    }
-                ]
+                "data": {
+                    "classes": [
+                        {
+                            "uuid": "cal-abc",
+                            "title": "OV | Classic CrossFit",
+                            "spotsAvailable": 9,
+                            "attendanceCap": 12,
+                            "registrationStartOffset": -20160,
+                            "registrationEndOffset": 0,
+                            "startTime": "2026-05-14T06:00:00.000Z",
+                            "endTime": "2026-05-14T07:00:00.000Z",
+                            "mainCoach": {
+                                "firstName": "Leilani",
+                                "lastName": "Tison",
+                                "__typename": "Profile",
+                            },
+                            "__typename": "Class",
+                        }
+                    ],
+                    "__typename": "Query",
+                }
             },
         )
     )
-    session = await pushpress.login("a@b.c", "pw")
-    try:
-        slots = await pushpress.list_schedule(
-            session, datetime(2026, 5, 15), datetime(2026, 5, 16)
-        )
-        assert len(slots) == 1
-        assert slots[0].id == "42"
-        assert slots[0].name == "Strength"
-        assert slots[0].spots_available == 3
-    finally:
-        await session.aclose()
+    slots = await pushpress.list_schedule(date(2026, 5, 14), date(2026, 5, 14))
+    assert len(slots) == 1
+    s = slots[0]
+    assert s.id == "cal-abc"
+    assert s.name == "OV | Classic CrossFit"
+    assert s.spots_available == 9
+    assert s.spots_total == 12
+    assert s.instructor == "Leilani Tison"
+    assert s.registration_start_offset_min == -20160
 
 
-@pytest.mark.asyncio
 @respx.mock
-async def test_book_returns_ok():
-    base = "https://members.pushpress.com"
-    respx.get(f"{base}/login").mock(return_value=httpx.Response(200, html=""))
-    respx.post(f"{base}/login").mock(return_value=httpx.Response(200, html=""))
-    respx.post(f"{base}/api/reservations").mock(
-        return_value=httpx.Response(200, json={"id": "r-99"})
+@pytest.mark.asyncio
+async def test_list_reservations_filters_cancelled():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "reservations": [
+                        {
+                            "uuid": "reg-1",
+                            "reservationTitle": "Classic CrossFit",
+                            "calendarItemUuid": "cal-1",
+                            "isActive": True,
+                            "isCancelled": False,
+                            "rawStartTime": "2026-05-14T06:00:00+00:00",
+                            "rawEndTime": "2026-05-14T07:00:00+00:00",
+                            "rawStatus": "registered",
+                            "calendarItem": {"mainCoach": None, "__typename": "Class"},
+                            "__typename": "Reservation",
+                        },
+                        {
+                            "uuid": "reg-2",
+                            "reservationTitle": "Cancelled one",
+                            "calendarItemUuid": "cal-2",
+                            "isActive": False,
+                            "isCancelled": True,
+                            "rawStartTime": "2026-05-14T08:00:00+00:00",
+                            "rawEndTime": "2026-05-14T09:00:00+00:00",
+                            "rawStatus": "cancelled",
+                            "calendarItem": {"mainCoach": None, "__typename": "Class"},
+                            "__typename": "Reservation",
+                        },
+                    ],
+                    "__typename": "Query",
+                }
+            },
+        )
     )
-    session = await pushpress.login("a@b.c", "pw")
-    try:
-        result = await pushpress.book(session, "42")
-        assert result.ok
-        assert result.reservation_id == "r-99"
-    finally:
-        await session.aclose()
+    items = await pushpress.list_reservations()
+    assert len(items) == 1
+    assert items[0].id == "reg-1"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_book_uses_tenant_uuids():
+    # First call -> profile lookup (lazy tenant load)
+    # Then mutation. respx side_effect handles ordering.
+    profile_resp = httpx.Response(
+        200,
+        json={
+            "data": {
+                "profile": {
+                    "clientUserUuid": "cuu-test",
+                    "userUuid": "usr_test",
+                    "clientUuid": "client_test",
+                    "firstName": "Test",
+                    "lastName": "User",
+                    "subscriptions": [
+                        {
+                            "subscriptionUuid": "sub_active",
+                            "status": "active",
+                            "active": True,
+                            "plan": "p1",
+                            "__typename": "Subscription",
+                        }
+                    ],
+                    "__typename": "Profile",
+                },
+                "__typename": "Query",
+            }
+        },
+    )
+    book_resp = httpx.Response(
+        200,
+        json={
+            "data": {
+                "createReservation": {"uuid": "reg-new", "__typename": "Registration"},
+                "__typename": "Mutation",
+            }
+        },
+    )
+    respx.post(pushpress.GRAPHQL_URL).mock(side_effect=[profile_resp, book_resp])
+    result = await pushpress.book("cal-xyz")
+    assert result.ok
+    assert result.reservation_id == "reg-new"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_book_returns_error_on_graphql_error():
+    profile_resp = httpx.Response(
+        200,
+        json={
+            "data": {
+                "profile": {
+                    "clientUserUuid": "cuu",
+                    "userUuid": "u",
+                    "clientUuid": "c",
+                    "firstName": "T",
+                    "lastName": "U",
+                    "subscriptions": [
+                        {
+                            "subscriptionUuid": "sub",
+                            "status": "active",
+                            "active": True,
+                            "plan": "p",
+                            "__typename": "Subscription",
+                        }
+                    ],
+                    "__typename": "Profile",
+                }
+            }
+        },
+    )
+    err_resp = httpx.Response(
+        200, json={"errors": [{"message": "Class full"}], "data": None}
+    )
+    respx.post(pushpress.GRAPHQL_URL).mock(side_effect=[profile_resp, err_resp])
+    result = await pushpress.book("cal-xyz")
+    assert not result.ok
+    assert "Class full" in result.message
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_cancel_returns_true_on_success():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "cancelReservation": {"uuid": "reg-1", "__typename": "Registration"}
+                }
+            },
+        )
+    )
+    assert await pushpress.cancel("reg-1") is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_no_token_raises():
+    pushpress.settings.pushpress_token = ""
+    with pytest.raises(RuntimeError, match="PUSHPRESS_TOKEN"):
+        await pushpress.list_schedule(date(2026, 5, 14), date(2026, 5, 14))

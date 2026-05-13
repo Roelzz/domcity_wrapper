@@ -14,10 +14,13 @@ class Settings(BaseSettings):
 
     fernet_key: str = ""
 
-    pushpress_base_url: str = "https://members.pushpress.com"
-    pushpress_email: str = ""
-    pushpress_password: str = ""
-    booking_window_hours: int = 24
+    # PushPress: bearer JWT from members.pushpress.com (~60-day lifetime).
+    # Refresh by opening the portal in a browser, copying the Authorization
+    # header from any /graphql request in DevTools, and updating this value.
+    pushpress_token: str = ""
+    # Default booking window for new automation rules (hours before class).
+    # This CrossFit gym opens its window 14 days = 336h ahead.
+    default_lead_time_hours: int = 336
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

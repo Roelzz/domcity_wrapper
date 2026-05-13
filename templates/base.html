@@ -28,6 +28,7 @@
     </nav>
   </header>
   <main class="container">
+    {% if token_warning %}<article class="warn-box">⏰ {{ token_warning }}</article>{% endif %}
     {% if error %}<article class="error-box">⚠️ {{ error }}</article>{% endif %}
     {% block content %}{% endblock %}
   </main>
