@@ -1,6 +1,20 @@
 :root {
   --pico-font-size: 15px;
-  --accent: #ff7849;
+  /* Soft cool green accent shades layered on top of Pico's green palette */
+  --dc-green-50:  #ecfdf5;
+  --dc-green-100: #d1fae5;
+  --dc-green-300: #6ee7b7;
+  --dc-green-500: #10b981;
+  --dc-green-600: #059669;
+  --dc-green-700: #047857;
+  --dc-green-800: #065f46;
+  /* A cool complementary slate for "category" tags so they don't clash */
+  --dc-slate-100: #e2e8f0;
+  --dc-slate-700: #334155;
+}
+
+body {
+  background: linear-gradient(180deg, #f6fbf8 0%, #ffffff 220px) fixed;
 }
 
 /* ---------- Nav ---------- */
@@ -12,8 +26,8 @@ header nav .nav-links a {
   text-decoration: none;
 }
 header nav .nav-links a.active {
-  background: var(--pico-primary-background);
-  color: var(--pico-primary-inverse);
+  background: var(--dc-green-600);
+  color: #fff;
 }
 
 /* ---------- Page head ---------- */
@@ -73,13 +87,13 @@ header nav .nav-links a.active {
 }
 .chip:active { transform: scale(0.97); }
 .chip.active {
-  background: var(--pico-primary-background);
-  color: var(--pico-primary-inverse) !important;
-  border-color: var(--pico-primary-background);
+  background: var(--dc-green-600);
+  color: #fff !important;
+  border-color: var(--dc-green-600);
 }
 .chip.active:hover {
-  background: var(--pico-primary-hover-background, var(--pico-primary-background));
-  filter: brightness(1.1);
+  background: var(--dc-green-700);
+  border-color: var(--dc-green-700);
 }
 .filter-summary { font-size: .8rem; margin: 0; }
 
@@ -99,7 +113,11 @@ header nav .nav-links a.active {
   border: 1px solid var(--pico-muted-border-color);
   min-height: 5rem;
 }
-.day-col.today { border-color: var(--pico-primary-background); box-shadow: 0 0 0 2px var(--pico-primary-background) inset; }
+.day-col.today {
+  border-color: var(--dc-green-500);
+  box-shadow: 0 0 0 2px var(--dc-green-500) inset;
+  background: linear-gradient(180deg, var(--dc-green-50) 0%, var(--pico-card-background-color) 60px);
+}
 .day-header {
   display: flex;
   flex-direction: column;
@@ -135,7 +153,11 @@ header nav .nav-links a.active {
   border-radius: var(--pico-border-radius);
   font-size: .85rem;
 }
-.class-card.booked { border-color: var(--pico-color-green-550); background: color-mix(in srgb, var(--pico-color-green-100) 40%, transparent); }
+.class-card.booked {
+  border-color: var(--dc-green-500);
+  background: var(--dc-green-50);
+  box-shadow: inset 3px 0 0 var(--dc-green-500);
+}
 .class-card.full { opacity: .55; }
 .class-time { font-weight: 700; font-size: .9rem; }
 .class-title { font-size: .85rem; line-height: 1.25; word-break: break-word; }
@@ -148,8 +170,14 @@ header nav .nav-links a.active {
   background: var(--pico-muted-border-color);
   white-space: nowrap;
 }
-.tag.loc { background: color-mix(in srgb, var(--pico-primary-background) 20%, transparent); }
-.tag.cat { background: color-mix(in srgb, var(--pico-color-orange-550) 18%, transparent); }
+.tag.loc {
+  background: var(--dc-green-100);
+  color: var(--dc-green-800);
+}
+.tag.cat {
+  background: var(--dc-slate-100);
+  color: var(--dc-slate-700);
+}
 .spots { font-size: .75rem; }
 
 .class-actions {
@@ -198,7 +226,7 @@ header nav .nav-links a.active {
 /* ---------- Common ---------- */
 .muted { color: var(--pico-muted-color); margin: 0; }
 .muted.small { font-size: .75rem; }
-.success { color: var(--pico-color-green-550); font-weight: 600; }
+.success { color: var(--dc-green-700); font-weight: 600; }
 .error   { color: var(--pico-color-red-550);  font-weight: 600; }
 .warn    { color: var(--pico-color-orange-550); font-weight: 600; }
 
