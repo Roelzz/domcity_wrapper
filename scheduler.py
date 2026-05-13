@@ -22,7 +22,6 @@ from settings import settings
 MAX_RETRIES = 5                 # transient retries only (network / 5xx)
 RETRY_DELAY_SEC = 30
 LOOKAHEAD_DAYS = 14
-POLL_INTERVAL_HOURS = 12        # check twice a day for "class full" rules
 MIN_HOURS_BEFORE_CLASS = 1      # stop polling this close to class start
 REMINDER_SCAN_INTERVAL_MIN = 15 # how often to refresh per-reservation reminders
 REMINDER_DAY_HOUR = 8           # local hour for the same-day reminder
@@ -457,9 +456,29 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
 async def _start_polling(rule: AutomationRule, slot, label: str, reason: str) -> None:
     _record(rule.id, label, "polling", reason)
     await notify.send(
-        f"⏳ {rule.name}: class is full, polling every {POLL_INTERVAL_HOURS}h for an opening"
+        f"⏳ {rule.name}: class is full, polling for an opening (cadence tightens as class approaches)"
     )
     await _schedule_poll(rule, slot)
+
+
+def _poll_interval_for(time_until_class: timedelta) -> timedelta:
+    """Adaptive poll cadence — tighter as the class approaches, because the
+    bulk of last-minute cancellations cluster in the final 24h.
+
+      > 48h:  12h
+      24h–48h: 4h
+      6h–24h:  1h
+      1h–6h:   15min
+      ≤1h:     handled by the deadline check, not this function
+    """
+    secs = time_until_class.total_seconds()
+    if secs > 48 * 3600:
+        return timedelta(hours=12)
+    if secs > 24 * 3600:
+        return timedelta(hours=4)
+    if secs > 6 * 3600:
+        return timedelta(hours=1)
+    return timedelta(minutes=15)
 
 
 async def _schedule_poll(rule: AutomationRule, slot) -> None:
@@ -468,7 +487,7 @@ async def _schedule_poll(rule: AutomationRule, slot) -> None:
     sch = get_scheduler()
     now = datetime.now(tz())
     class_start = slot.start.astimezone(tz())
-    next_poll = now + timedelta(hours=POLL_INTERVAL_HOURS)
+    next_poll = now + _poll_interval_for(class_start - now)
     deadline = class_start - timedelta(hours=MIN_HOURS_BEFORE_CLASS)
     if next_poll > deadline:
         # Out of time. Final failure, advance to next week.

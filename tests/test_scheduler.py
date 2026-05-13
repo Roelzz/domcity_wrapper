@@ -1,6 +1,8 @@
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
+
 import scheduler
 from models import AutomationRule
 from pushpress import ClassSlot
@@ -57,6 +59,24 @@ def test_window_open_with_zero_offset_is_class_start():
         registration_start_offset_min=0,
     )
     assert scheduler.window_open_time(slot) == start
+
+
+@pytest.mark.parametrize(
+    "hours_until_class, expected_interval_min",
+    [
+        (100, 12 * 60),  # >48h -> 12h
+        (49, 12 * 60),   # boundary just above
+        (47, 4 * 60),    # 24h–48h -> 4h
+        (25, 4 * 60),    # boundary just above 24h
+        (23, 60),        # 6h–24h -> 1h
+        (7, 60),         # boundary
+        (5, 15),         # 1h–6h -> 15m
+        (1.5, 15),       # boundary
+    ],
+)
+def test_poll_interval_brackets(hours_until_class, expected_interval_min):
+    interval = scheduler._poll_interval_for(timedelta(hours=hours_until_class))
+    assert interval.total_seconds() / 60 == expected_interval_min
 
 
 def test_match_slot_filters_by_location_and_category():
