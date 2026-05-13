@@ -54,21 +54,32 @@ header nav .nav-links a.active {
 }
 .chip {
   display: inline-block;
-  padding: .25rem .7rem;
+  padding: .3rem .85rem;
   border-radius: 999px;
   border: 1px solid var(--pico-muted-border-color);
-  background: transparent;
-  color: var(--pico-color);
+  background: var(--pico-background-color);
+  color: var(--pico-color) !important;
   font-size: .85rem;
-  text-decoration: none;
+  font-weight: 500;
+  text-decoration: none !important;
   white-space: nowrap;
-  transition: background 100ms ease;
+  cursor: pointer;
+  user-select: none;
+  transition: background 100ms ease, border-color 100ms ease, transform 80ms ease;
 }
-.chip:hover { background: var(--pico-muted-border-color); }
+.chip:hover {
+  background: var(--pico-muted-border-color);
+  border-color: var(--pico-primary-background);
+}
+.chip:active { transform: scale(0.97); }
 .chip.active {
   background: var(--pico-primary-background);
-  color: var(--pico-primary-inverse);
+  color: var(--pico-primary-inverse) !important;
   border-color: var(--pico-primary-background);
+}
+.chip.active:hover {
+  background: var(--pico-primary-hover-background, var(--pico-primary-background));
+  filter: brightness(1.1);
 }
 .filter-summary { font-size: .8rem; margin: 0; }
 

@@ -18,9 +18,6 @@ class Settings(BaseSettings):
     # Refresh by opening the portal in a browser, copying the Authorization
     # header from any /graphql request in DevTools, and updating this value.
     pushpress_token: str = ""
-    # Default booking window for new automation rules (hours before class).
-    # This CrossFit gym opens its window 14 days = 336h ahead.
-    default_lead_time_hours: int = 336
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

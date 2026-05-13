@@ -34,6 +34,7 @@ DAYS_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 async def lifespan(app: FastAPI):
     init_db()
     scheduler.start()
+    await scheduler.reschedule_all()
     await _check_token_expiry()
     logger.info("Domcity Planner up on port {}", settings.port)
     yield
@@ -197,7 +198,6 @@ async def automation_page(
     prefill_category: str | None = None,
     prefill_day: int | None = None,
     prefill_time: str | None = None,
-    prefill_lead: int | None = None,
 ):
     with DbSession(engine) as db:
         rules = db.exec(select(AutomationRule).order_by(AutomationRule.day_of_week)).all()
@@ -205,28 +205,68 @@ async def automation_page(
             select(BookingAttempt).order_by(BookingAttempt.fired_at.desc()).limit(20)
         ).all()
     locations, categories = await _known_locations_and_categories()
+    next_fires = {}
+    for r in rules:
+        if not r.enabled:
+            continue
+        try:
+            fire = await scheduler.next_window_open_async(r)
+            next_fires[r.id] = fire.isoformat() if fire else "—"
+        except Exception:
+            next_fires[r.id] = "—"
+    # Pre-compute initial time slots if all three selectors are pre-filled
+    initial_slots: list[str] = []
+    if prefill_location and prefill_category and prefill_day is not None:
+        initial_slots = await _time_slots_for(prefill_location, prefill_category, int(prefill_day))
     ctx = {
         "active": "automation",
         "rules": rules,
         "attempts": attempts,
-        "next_fires": {
-            r.id: scheduler.next_window_open(r).isoformat() for r in rules if r.enabled
-        },
+        "next_fires": next_fires,
         "days": list(enumerate(DAYS_LONG)),
         "locations": locations,
         "categories": categories,
-        "default_lead_time_hours": settings.default_lead_time_hours,
+        "initial_time_slots": initial_slots,
         "prefill": {
             "name": prefill_name or "",
             "location": prefill_location or "",
             "category": prefill_category or "",
             "day": prefill_day if prefill_day is not None else "",
             "time": prefill_time or "",
-            "lead": prefill_lead or settings.default_lead_time_hours,
         },
         "token_warning": _token_warning(),
     }
     return templates.TemplateResponse(request, "automation.html", ctx)
+
+
+@app.get("/automation/time-slots", response_class=HTMLResponse)
+async def automation_time_slots(
+    request: Request,
+    location: str = "",
+    class_category: str = "",
+    day_of_week: str = "",
+    time_of_day: str = "",
+):
+    """HTMX partial: returns a <select name=time_of_day> populated with the
+    available times for the given (location, category, day) combo."""
+    try:
+        dow = int(day_of_week) if day_of_week != "" else None
+    except ValueError:
+        dow = None
+    has_all_selectors = bool(location and class_category and dow is not None)
+    slots: list[str] = []
+    if has_all_selectors:
+        slots = await _time_slots_for(location, class_category, dow)
+    return templates.TemplateResponse(
+        request,
+        "_time_slot_select.html",
+        {
+            "slots": slots,
+            "selected": time_of_day,
+            "ready": bool(slots),
+            "selectors_complete": has_all_selectors,
+        },
+    )
 
 
 @app.get("/automation/from-class/{slot_id}")
@@ -235,8 +275,6 @@ async def automation_from_class(slot_id: str):
     if not settings.pushpress_token:
         return RedirectResponse("/automation", status_code=303)
     today = datetime.now().date()
-    # Lookback to start of current week so users can click slots earlier in the
-    # visible week. Lookahead 14 days to cover next week + booking window.
     classes = await pushpress.list_schedule(
         today - timedelta(days=today.weekday()), today + timedelta(days=14)
     )
@@ -252,8 +290,6 @@ async def automation_from_class(slot_id: str):
         "prefill_category": slot.category,
         "prefill_day": slot.start.weekday(),
         "prefill_time": slot.start.strftime("%H:%M"),
-        "prefill_lead": abs(slot.registration_start_offset_min or 0) // 60
-        or settings.default_lead_time_hours,
     })
     return RedirectResponse(f"/automation?{qs}", status_code=303)
 
@@ -265,7 +301,6 @@ async def automation_create(
     class_category: str = Form(...),
     day_of_week: int = Form(...),
     time_of_day: str = Form(...),
-    lead_time_hours: int = Form(None),
 ):
     try:
         hh, mm = (int(x) for x in time_of_day.split(":")[:2])
@@ -277,14 +312,13 @@ async def automation_create(
         class_category=class_category.strip(),
         day_of_week=day_of_week,
         time_of_day=time(hour=hh, minute=mm),
-        lead_time_hours=lead_time_hours or settings.default_lead_time_hours,
         enabled=True,
     )
     with DbSession(engine) as db:
         db.add(rule)
         db.commit()
         db.refresh(rule)
-    scheduler.schedule_rule(rule)
+    await scheduler.schedule_rule(rule)
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -297,7 +331,7 @@ async def automation_toggle(rule_id: int):
         rule.enabled = not rule.enabled
         db.add(rule)
         db.commit()
-    scheduler.reschedule_all()
+    await scheduler.reschedule_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -308,7 +342,7 @@ async def automation_delete(rule_id: int):
         if rule:
             db.delete(rule)
             db.commit()
-    scheduler.reschedule_all()
+    await scheduler.reschedule_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -369,6 +403,28 @@ async def _booked_class_ids() -> set[str]:
         return {r.class_id for r in await pushpress.list_reservations() if r.class_id}
     except Exception:
         return set()
+
+
+async def _time_slots_for(location: str, category: str, day_of_week: int) -> list[str]:
+    """Return unique HH:MM strings for upcoming classes matching the combo."""
+    if not settings.pushpress_token:
+        return []
+    today = datetime.now().date()
+    try:
+        items = await pushpress.list_schedule(today, today + timedelta(days=14))
+    except Exception:
+        logger.exception("time slots fetch failed")
+        return []
+    seen: set[str] = set()
+    for c in items:
+        if c.location.lower() != location.lower():
+            continue
+        if c.category.lower() != category.lower():
+            continue
+        if c.start.weekday() != day_of_week:
+            continue
+        seen.add(c.start.strftime("%H:%M"))
+    return sorted(seen)
 
 
 async def _known_locations_and_categories() -> tuple[list[str], list[str]]:

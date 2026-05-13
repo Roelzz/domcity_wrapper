@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Schedule · Domcity Planner{% endblock %}
 
-{# Helper macros for building toggle URLs #}
+{# Helper: build a URL with location/category toggled. Uses urlencode so
+   values with spaces (e.g. "Havenweg 6") become "Havenweg+6". #}
 {% macro toggle_url(kind, value) -%}
 {%- set sel = selected_locations if kind == 'locations' else selected_categories -%}
 {%- if value in sel -%}
@@ -11,11 +12,17 @@
 {%- endif -%}
 {%- set other_kind = 'categories' if kind == 'locations' else 'locations' -%}
 {%- set other_sel = selected_categories if kind == 'locations' else selected_locations -%}
-{%- set params = [] -%}
-{%- if new -%}{%- set _ = params.append(kind ~ '=' ~ (new | join(','))) -%}{%- endif -%}
-{%- if other_sel -%}{%- set _ = params.append(other_kind ~ '=' ~ (other_sel | join(','))) -%}{%- endif -%}
-{%- set _ = params.append('start=' ~ start.isoformat()) -%}
-/schedule?{{ params | join('&') }}
+{%- set params = {'start': start.isoformat()} -%}
+{%- if new -%}{%- set _ = params.update({kind: new | join(',')}) -%}{%- endif -%}
+{%- if other_sel -%}{%- set _ = params.update({other_kind: other_sel | sort | join(',')}) -%}{%- endif -%}
+/schedule?{{ params | urlencode }}
+{%- endmacro %}
+
+{% macro all_url(keep_kind) -%}
+{%- set keep_sel = selected_categories if keep_kind == 'categories' else selected_locations -%}
+{%- set params = {'start': start.isoformat()} -%}
+{%- if keep_sel -%}{%- set _ = params.update({keep_kind: keep_sel | sort | join(',')}) -%}{%- endif -%}
+/schedule?{{ params | urlencode }}
 {%- endmacro %}
 
 {% block content %}
@@ -38,7 +45,7 @@
     <div class="filter-row">
       <span class="filter-label">Location</span>
       <a class="chip {% if not selected_locations %}active{% endif %}"
-         href="/schedule?start={{ start.isoformat() }}{% if selected_categories %}&categories={{ selected_categories | join(',') }}{% endif %}">All</a>
+         href="{{ all_url('categories') }}">All</a>
       {% for loc in all_locations %}
         <a class="chip {% if loc in selected_locations %}active{% endif %}"
            href="{{ toggle_url('locations', loc) }}">{{ loc }}</a>
@@ -47,7 +54,7 @@
     <div class="filter-row">
       <span class="filter-label">Training</span>
       <a class="chip {% if not selected_categories %}active{% endif %}"
-         href="/schedule?start={{ start.isoformat() }}{% if selected_locations %}&locations={{ selected_locations | join(',') }}{% endif %}">All</a>
+         href="{{ all_url('locations') }}">All</a>
       {% for cat in all_categories %}
         <a class="chip {% if cat in selected_categories %}active{% endif %}"
            href="{{ toggle_url('categories', cat) }}">{{ cat }}</a>

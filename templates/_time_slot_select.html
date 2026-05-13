@@ -1,0 +1,14 @@
+<select name="time_of_day" required id="time-slot-select"{% if not ready %} disabled{% endif %}>
+  {% if not ready %}
+    {% if selectors_complete %}
+      <option value="" disabled selected>— no upcoming classes match —</option>
+    {% else %}
+      <option value="" disabled selected>— pick location, training &amp; day —</option>
+    {% endif %}
+  {% else %}
+    {% if not selected %}<option value="" disabled selected>— select time —</option>{% endif %}
+    {% for t in slots %}
+      <option value="{{ t }}" {% if t == selected %}selected{% endif %}>{{ t }}</option>
+    {% endfor %}
+  {% endif %}
+</select>

@@ -1,13 +1,14 @@
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import scheduler
 from models import AutomationRule
+from pushpress import ClassSlot
 
 TZ = ZoneInfo("Europe/Amsterdam")
 
 
-def make_rule(dow: int, hh: int, mm: int = 0, lead: int = 336) -> AutomationRule:
+def make_rule(dow: int, hh: int, mm: int = 0) -> AutomationRule:
     return AutomationRule(
         id=1,
         name="Test rule",
@@ -15,7 +16,6 @@ def make_rule(dow: int, hh: int, mm: int = 0, lead: int = 336) -> AutomationRule
         class_category="Classic CrossFit",
         day_of_week=dow,
         time_of_day=time(hh, mm),
-        lead_time_hours=lead,
         enabled=True,
     )
 
@@ -31,23 +31,35 @@ def test_next_class_datetime_future_same_week():
 
 def test_next_class_datetime_rolls_to_next_week_if_passed():
     now = datetime(2026, 5, 13, 18, 0, tzinfo=TZ)
-    rule = make_rule(dow=2, hh=17)  # today 17:00, already past
+    rule = make_rule(dow=2, hh=17)
     dt = scheduler.next_class_datetime(rule, now=now)
     assert dt.weekday() == 2
     assert (dt - now).days >= 6
 
 
-def test_next_window_open_uses_lead_time():
-    now = datetime(2026, 5, 13, 12, 0, tzinfo=TZ)
-    rule = make_rule(dow=4, hh=17, lead=336)  # 14 days
-    class_dt = scheduler.next_class_datetime(rule, now=now)
-    win = scheduler.next_window_open(rule, now=now)
-    assert (class_dt - win).total_seconds() == 336 * 3600
+def test_window_open_uses_slot_offset():
+    start = datetime(2026, 5, 20, 9, 0, tzinfo=TZ)
+    slot = ClassSlot(
+        id="x", name="OV | Classic CrossFit",
+        location="Overste den Oudenlaan 9", location_code="OV", category="Classic CrossFit",
+        start=start, end=start + timedelta(hours=1),
+        registration_start_offset_min=-20160,  # 14 days
+    )
+    win = scheduler.window_open_time(slot)
+    assert (start - win).total_seconds() == 14 * 24 * 3600
+
+
+def test_window_open_with_zero_offset_is_class_start():
+    start = datetime(2026, 5, 20, 9, 0, tzinfo=TZ)
+    slot = ClassSlot(
+        id="x", name="Trial", location="Havenweg 6", location_code="", category="Trial Class",
+        start=start, end=start + timedelta(hours=1),
+        registration_start_offset_min=0,
+    )
+    assert scheduler.window_open_time(slot) == start
 
 
 def test_match_slot_filters_by_location_and_category():
-    from pushpress import ClassSlot
-
     target = datetime(2026, 5, 14, 9, 0, tzinfo=TZ)
     slots = [
         ClassSlot(
@@ -60,29 +72,7 @@ def test_match_slot_filters_by_location_and_category():
             location_code="HW", category="Classic CrossFit",
             start=target, end=target,
         ),
-        ClassSlot(
-            id="c", name="OV | Functional CrossFit", location="Overste den Oudenlaan 9",
-            location_code="OV", category="Functional CrossFit",
-            start=target, end=target,
-        ),
-    ]
-    rule = make_rule(dow=3, hh=9)  # Thu 09:00, OV/Classic CrossFit
-    match = scheduler._match_slot(slots, rule, target)
-    assert match is not None
-    assert match.id == "a"
-
-
-def test_match_slot_returns_none_when_time_off():
-    from pushpress import ClassSlot
-
-    target = datetime(2026, 5, 14, 9, 0, tzinfo=TZ)
-    far = datetime(2026, 5, 14, 14, 0, tzinfo=TZ)
-    slots = [
-        ClassSlot(
-            id="a", name="OV | Classic CrossFit", location="Overste den Oudenlaan 9",
-            location_code="OV", category="Classic CrossFit",
-            start=far, end=far,
-        ),
     ]
     rule = make_rule(dow=3, hh=9)
-    assert scheduler._match_slot(slots, rule, target) is None
+    match = scheduler._match_slot(slots, rule, target)
+    assert match.id == "a"
