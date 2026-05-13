@@ -13,6 +13,5 @@ data/
 .DS_Store
 .idea/
 .vscode/
-uv.lock
 docs/endpoints.md
 docs/*.har
