@@ -30,9 +30,20 @@ FAKE_JWT = "header." + base64.urlsafe_b64encode(
 
 @pytest.fixture(autouse=True)
 def fake_token(monkeypatch):
-    monkeypatch.setattr(settings_module.settings, "pushpress_token", FAKE_JWT)
-    pushpress._tenant = None  # reset cache between tests
+    """Bypass real login by priming the in-process token and stubbing ensure_token."""
+    monkeypatch.setattr(settings_module.settings, "pushpress_email", "test@example.com")
+    monkeypatch.setattr(settings_module.settings, "pushpress_password", "test-pw")
+    pushpress._set_active_token(FAKE_JWT)
+    pushpress._tenant = None
+
+    async def _noop() -> str:
+        return FAKE_JWT
+    monkeypatch.setattr(pushpress, "ensure_token", _noop)
+    monkeypatch.setattr(pushpress, "force_refresh", _noop)
     yield
+    pushpress._active_token = ""
+    pushpress._active_expiry = None
+    pushpress._tenant = None
 
 
 def test_decode_jwt_extracts_claims():
@@ -227,7 +238,20 @@ async def test_cancel_returns_true_on_success():
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_no_token_raises():
-    pushpress.settings.pushpress_token = ""
-    with pytest.raises(RuntimeError, match="PUSHPRESS_TOKEN"):
+async def test_no_creds_raises(monkeypatch):
+    monkeypatch.setattr(pushpress.settings, "pushpress_email", "")
+    monkeypatch.setattr(pushpress.settings, "pushpress_password", "")
+    with pytest.raises(RuntimeError, match="PUSHPRESS_EMAIL"):
         await pushpress.list_schedule(date(2026, 5, 14), date(2026, 5, 14))
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_login_parses_access_token():
+    """Hit the real login endpoint shape with a mocked response."""
+    respx.post(pushpress.LOGIN_URL).mock(
+        return_value=httpx.Response(200, json={"accessToken": FAKE_JWT, "refreshToken": "rt"})
+    )
+    token, expiry = await pushpress.login("a@b.c", "pw")
+    assert token == FAKE_JWT
+    assert expiry.year >= 2286  # exp=9999999999

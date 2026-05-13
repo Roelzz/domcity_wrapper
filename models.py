@@ -31,5 +31,14 @@ class BookingAttempt(SQLModel, table=True):
     message: str = ""
 
 
+class TokenCache(SQLModel, table=True):
+    """Singleton row (id=1) caching the active PushPress JWT and its expiry.
+    Refreshed by logging in with email+password whenever <7 days remain."""
+    id: int | None = Field(default=1, primary_key=True)
+    access_token: str
+    expires_at: datetime
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)

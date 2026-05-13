@@ -3,14 +3,16 @@ PushPress members API client.
 
 The members portal at members.pushpress.com is a Flutter SPA that talks to
 a GraphQL backend at api.pushpress.com/v2/graph/graphql. Auth is a bearer
-JWT (HS256, server-signed) with a ~60-day lifetime. There is no programmatic
-login endpoint exposed to members — the token is minted server-side after
-form login in the SPA. To refresh, the user opens members.pushpress.com in a
-browser, copies a fresh `Authorization: Bearer …` value from any GraphQL
-request in DevTools, and updates PUSHPRESS_TOKEN in .env.
+JWT (HS256, server-signed) with a ~60-day lifetime.
+
+Tokens are minted by POSTing email+password to /v2/auth/login. The app
+caches the JWT in SQLite (TokenCache singleton), serves it from memory on
+each GraphQL call, and the scheduler runs a daily 03:00 cron to re-login
+whenever the cached token has < 7 days left. A 401/403 on any GraphQL call
+also triggers an inline refresh + retry.
 
 clientUuid + userUuid are decoded from the JWT. clientUserUuid and the
-active subscriptionUuid are fetched once at startup via GetProfiles.
+active subscriptionUuid are fetched once via GetProfiles and cached.
 """
 
 from __future__ import annotations
@@ -29,7 +31,9 @@ from pydantic import BaseModel
 
 from settings import settings
 
-GRAPHQL_URL = "https://api.pushpress.com/v2/graph/graphql"
+API_BASE = "https://api.pushpress.com"
+GRAPHQL_URL = f"{API_BASE}/v2/graph/graphql"
+LOGIN_URL = f"{API_BASE}/v2/auth/login"
 DEFAULT_HEADERS = {
     "content-type": "application/json",
     "accept": "*/*",
@@ -72,7 +76,7 @@ class BookingResult(BaseModel):
     message: str = ""
 
 
-# -------- JWT helpers --------------------------------------------------------
+# -------- JWT + token lifecycle ----------------------------------------------
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any]:
@@ -83,23 +87,125 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
     return json.loads(base64.urlsafe_b64decode(parts[1] + pad))
 
 
-def token_expiry() -> datetime | None:
-    if not settings.pushpress_token:
-        return None
+# In-process active token. Primed at startup from DB, refreshed by login().
+_active_token: str = ""
+_active_expiry: datetime | None = None
+_token_lock = asyncio.Lock()
+
+
+def _set_active_token(token: str) -> None:
+    """Set the in-process token and parse its expiry. Also resets caches that
+    depended on the previous token's tenant context."""
+    global _active_token, _active_expiry, _tenant
+    _active_token = token
     try:
-        claims = _decode_jwt_payload(settings.pushpress_token)
-        return datetime.fromtimestamp(claims["exp"], tz=UTC)
-    except Exception as e:
-        logger.warning("Could not decode token expiry: {}", e)
-        return None
+        _active_expiry = datetime.fromtimestamp(
+            _decode_jwt_payload(token)["exp"], tz=UTC
+        )
+    except Exception:
+        _active_expiry = None
+    _tenant = None  # force re-lookup of profile under new token
+
+
+def active_token() -> str:
+    return _active_token
+
+
+def token_expiry() -> datetime | None:
+    return _active_expiry
 
 
 def token_user_uuid() -> str:
-    return _decode_jwt_payload(settings.pushpress_token).get("sub", "")
+    if not _active_token:
+        return ""
+    return _decode_jwt_payload(_active_token).get("sub", "")
 
 
 def token_client_uuid() -> str:
-    return _decode_jwt_payload(settings.pushpress_token).get("clientUuid", "")
+    if not _active_token:
+        return ""
+    return _decode_jwt_payload(_active_token).get("clientUuid", "")
+
+
+async def login(email: str, password: str) -> tuple[str, datetime]:
+    """Exchange email+password for a fresh access token. Returns (token, expiry).
+    Does not persist — caller writes to DB."""
+    if not email or not password:
+        raise RuntimeError("PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD not set")
+    client = _get_client()
+    r = await client.post(
+        LOGIN_URL,
+        headers={
+            "content-type": "application/json",
+            "accept": "*/*",
+            "origin": "https://members.pushpress.com",
+            "referer": "https://members.pushpress.com/",
+        },
+        json={"username": email, "password": password},
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"PushPress login failed: HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    token = data.get("accessToken")
+    if not token:
+        raise RuntimeError(f"Login response missing accessToken: keys={list(data.keys())}")
+    claims = _decode_jwt_payload(token)
+    expiry = datetime.fromtimestamp(claims["exp"], tz=UTC)
+    logger.info("PushPress login OK, token expires {}", expiry.isoformat())
+    return token, expiry
+
+
+async def ensure_token() -> str:
+    """Ensure the in-process token is valid. Reads cache from DB on first call,
+    refreshes via login() if expired or missing. Returns the active token."""
+    if _active_token and _active_expiry and _active_expiry > datetime.now(UTC):
+        return _active_token
+    async with _token_lock:
+        if _active_token and _active_expiry and _active_expiry > datetime.now(UTC):
+            return _active_token
+        # Try DB cache first
+        from sqlmodel import Session as _Sess
+
+        from models import TokenCache as _TC
+        from models import engine as _engine
+        cached = None
+        with _Sess(_engine) as db:
+            cached = db.get(_TC, 1)
+        if cached:
+            try:
+                exp = datetime.fromtimestamp(
+                    _decode_jwt_payload(cached.access_token)["exp"], tz=UTC
+                )
+            except Exception:
+                exp = None
+            if exp and exp > datetime.now(UTC) + timedelta(minutes=5):
+                _set_active_token(cached.access_token)
+                logger.info("Token loaded from DB cache, expires {}", exp.isoformat())
+                return _active_token
+        # Cache empty or expired -> log in fresh
+        token, expiry = await login(settings.pushpress_email, settings.pushpress_password)
+        _set_active_token(token)
+        # Persist
+        with _Sess(_engine) as db:
+            row = db.get(_TC, 1)
+            if row:
+                row.access_token = token
+                row.expires_at = expiry
+                row.updated_at = datetime.now(UTC).replace(tzinfo=None)
+                db.add(row)
+            else:
+                db.add(_TC(id=1, access_token=token, expires_at=expiry))
+            db.commit()
+        return _active_token
+
+
+async def force_refresh() -> str:
+    """Drop the cache and re-login. Used by the daily cron + on 401 retries."""
+    global _active_token, _active_expiry
+    async with _token_lock:
+        _active_token = ""
+        _active_expiry = None
+    return await ensure_token()
 
 
 # -------- Client state -------------------------------------------------------
@@ -121,8 +227,8 @@ async def get_tenant() -> TenantContext:
     global _tenant
     if _tenant is not None:
         return _tenant
-    if not settings.pushpress_token:
-        raise RuntimeError("PUSHPRESS_TOKEN not set")
+    if not settings.pushpress_email or not settings.pushpress_password:
+        raise RuntimeError("PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD not set")
     client_uuid = token_client_uuid()
     user_uuid = token_user_uuid()
     profile = await _gql(_QUERY_PROFILE, {"clientUuid": client_uuid, "userUuid": user_uuid})
@@ -195,8 +301,8 @@ async def _get_day(day: date) -> list[ClassSlot]:
 async def list_schedule(start: date, end: date) -> list[ClassSlot]:
     """Fetch classes in [start, end] (inclusive). Days fetched in parallel
     via asyncio.gather and cached in-memory for 60 seconds."""
-    if not settings.pushpress_token:
-        raise RuntimeError("PUSHPRESS_TOKEN not set")
+    if not settings.pushpress_email or not settings.pushpress_password:
+        raise RuntimeError("PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD not set")
     days: list[date] = []
     day = start
     while day <= end:
@@ -215,8 +321,8 @@ def invalidate_schedule_cache() -> None:
 
 
 async def list_reservations() -> list[Reservation]:
-    if not settings.pushpress_token:
-        raise RuntimeError("PUSHPRESS_TOKEN not set")
+    if not settings.pushpress_email or not settings.pushpress_password:
+        raise RuntimeError("PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD not set")
     global _reservations_cache
     if _reservations_cache and _now() - _reservations_cache[0] < _RESERVATIONS_TTL_SEC:
         return _reservations_cache[1]
@@ -307,19 +413,42 @@ async def aclose() -> None:
 
 
 async def _gql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
-    headers = {
-        **DEFAULT_HEADERS,
-        "authorization": f"Bearer {settings.pushpress_token}",
-    }
+    token = await ensure_token()
     body = {"operationName": None, "variables": variables, "query": query}
     client = _get_client()
-    r = await client.post(GRAPHQL_URL, headers=headers, json=body)
+    r = await client.post(
+        GRAPHQL_URL,
+        headers={**DEFAULT_HEADERS, "authorization": f"Bearer {token}"},
+        json=body,
+    )
+    # If the token was revoked or rotated server-side, refresh once and retry.
+    if r.status_code in (401, 403):
+        logger.info("PushPress returned {} — refreshing token and retrying", r.status_code)
+        token = await force_refresh()
+        r = await client.post(
+            GRAPHQL_URL,
+            headers={**DEFAULT_HEADERS, "authorization": f"Bearer {token}"},
+            json=body,
+        )
     if r.status_code != 200:
         raise _GqlError(f"HTTP {r.status_code}: {r.text[:300]}")
     payload = r.json()
     if payload.get("errors"):
         msg = "; ".join(e.get("message", "") for e in payload["errors"])
-        raise _GqlError(msg)
+        if "Token" in msg or "token" in msg:
+            logger.info("GraphQL token error — refreshing and retrying once")
+            token = await force_refresh()
+            r = await client.post(
+                GRAPHQL_URL,
+                headers={**DEFAULT_HEADERS, "authorization": f"Bearer {token}"},
+                json=body,
+            )
+            payload = r.json()
+            if payload.get("errors"):
+                msg2 = "; ".join(e.get("message", "") for e in payload["errors"])
+                raise _GqlError(msg2)
+        else:
+            raise _GqlError(msg)
     return payload.get("data") or {}
 
 

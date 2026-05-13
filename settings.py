@@ -14,10 +14,11 @@ class Settings(BaseSettings):
 
     fernet_key: str = ""
 
-    # PushPress: bearer JWT from members.pushpress.com (~60-day lifetime).
-    # Refresh by opening the portal in a browser, copying the Authorization
-    # header from any /graphql request in DevTools, and updating this value.
-    pushpress_token: str = ""
+    # PushPress login. The app POSTs to /v2/auth/login on startup and again
+    # whenever the cached JWT is within 7 days of expiry, so you never touch
+    # tokens manually.
+    pushpress_email: str = ""
+    pushpress_password: str = ""
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

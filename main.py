@@ -1,6 +1,6 @@
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -35,12 +35,24 @@ SLOT_SEPARATOR = "|"
 async def lifespan(app: FastAPI):
     init_db()
     scheduler.start()
+    await _prime_token()
     await scheduler.reschedule_all()
-    await _check_token_expiry()
+    scheduler.schedule_token_refresh()
     logger.info("Domcity Planner up on port {}", settings.port)
     yield
     scheduler.shutdown()
     await pushpress.aclose()
+
+
+async def _prime_token() -> None:
+    if not (settings.pushpress_email and settings.pushpress_password):
+        logger.warning("PUSHPRESS_EMAIL/PASSWORD not set — API calls will fail")
+        return
+    try:
+        await pushpress.ensure_token()
+    except Exception as e:
+        logger.error("Initial token load failed: {}", e)
+        await notify.send(f"❌ Domcity Planner: PushPress login failed at startup\n{e}")
 
 
 app = FastAPI(title="Domcity Planner", lifespan=lifespan)
@@ -251,7 +263,7 @@ async def automation_page(
 
 async def _fetch_classes_for_automation():
     """Single 14-day fetch reused for all automation-page computations."""
-    if not settings.pushpress_token:
+    if not (settings.pushpress_email and settings.pushpress_password):
         return []
     today = datetime.now().date()
     try:
@@ -316,7 +328,7 @@ async def automation_time_slots(
 @app.get("/automation/from-class/{slot_id}")
 async def automation_from_class(slot_id: str):
     """Look up a class slot and redirect to /automation with the form pre-filled."""
-    if not settings.pushpress_token:
+    if not (settings.pushpress_email and settings.pushpress_password):
         return RedirectResponse("/automation", status_code=303)
     today = datetime.now().date()
     classes = await pushpress.list_schedule(
@@ -420,7 +432,7 @@ def _filter_query(locs: set[str], cats: set[str]) -> str:
 
 
 async def _fetch_schedule(start_d: date, end_d: date):
-    if not settings.pushpress_token:
+    if not (settings.pushpress_email and settings.pushpress_password):
         return [], "PUSHPRESS_TOKEN not set — see .env.example for how to obtain it."
     try:
         items = await pushpress.list_schedule(start_d, end_d)
@@ -431,7 +443,7 @@ async def _fetch_schedule(start_d: date, end_d: date):
 
 
 async def _fetch_reservations():
-    if not settings.pushpress_token:
+    if not (settings.pushpress_email and settings.pushpress_password):
         return [], "PUSHPRESS_TOKEN not set."
     try:
         return await pushpress.list_reservations(), None
@@ -441,7 +453,7 @@ async def _fetch_reservations():
 
 
 async def _booked_class_ids() -> set[str]:
-    if not settings.pushpress_token:
+    if not (settings.pushpress_email and settings.pushpress_password):
         return set()
     try:
         return {r.class_id for r in await pushpress.list_reservations() if r.class_id}
@@ -452,7 +464,7 @@ async def _booked_class_ids() -> set[str]:
 async def _time_slots_for(category: str, day_of_week: int) -> list[tuple[str, str]]:
     """Return unique (location, HH:MM) tuples for upcoming classes matching
     the (category, day) combo. Sorted by time then location for easy scanning."""
-    if not settings.pushpress_token:
+    if not (settings.pushpress_email and settings.pushpress_password):
         return []
     today = datetime.now().date()
     try:
@@ -473,24 +485,12 @@ async def _time_slots_for(category: str, day_of_week: int) -> list[tuple[str, st
 
 
 def _token_warning() -> str | None:
-    if not settings.pushpress_token:
-        return None
-    exp = pushpress.token_expiry()
-    if not exp:
-        return None
-    days_left = (exp - datetime.now(UTC)).days
-    if days_left < 0:
-        return "PushPress token expired — refresh PUSHPRESS_TOKEN."
-    if days_left <= 7:
-        return f"PushPress token expires in {days_left} days — refresh soon."
+    """App auto-refreshes the token; banner only fires for real problems."""
+    if not (settings.pushpress_email and settings.pushpress_password):
+        return "PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD not configured."
+    if not pushpress.active_token():
+        return "PushPress login has not succeeded yet — check logs."
     return None
-
-
-async def _check_token_expiry() -> None:
-    msg = _token_warning()
-    if msg:
-        logger.warning(msg)
-        await notify.send(f"⚠️ Domcity Planner: {msg}")
 
 
 if __name__ == "__main__":

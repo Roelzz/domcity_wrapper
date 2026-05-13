@@ -70,6 +70,43 @@ def shutdown() -> None:
         logger.info("Scheduler stopped")
 
 
+def schedule_token_refresh() -> None:
+    """Daily 03:00 cron: re-login if the cached token expires in < 7 days."""
+    sch = get_scheduler()
+    sch.add_job(
+        token_refresh_job,
+        "cron",
+        hour=3,
+        minute=0,
+        id="token-refresh",
+        replace_existing=True,
+    )
+    logger.info("Token refresh cron scheduled daily at 03:00 {}", settings.tz)
+
+
+async def token_refresh_job() -> None:
+    exp = pushpress.token_expiry()
+    if not exp:
+        logger.warning("Token refresh job: no active token, forcing login")
+        try:
+            await pushpress.force_refresh()
+        except Exception as e:
+            logger.error("Token refresh failed: {}", e)
+            await notify.send(f"❌ Domcity Planner: token refresh failed\n{e}")
+        return
+    days_left = (exp - datetime.now(tz()).astimezone(exp.tzinfo)).days
+    if days_left > 7:
+        logger.info("Token has {} days left, no refresh needed", days_left)
+        return
+    logger.info("Token has {} days left, refreshing", days_left)
+    try:
+        await pushpress.force_refresh()
+        await notify.send(f"🔑 Domcity Planner: refreshed PushPress token (was {days_left}d from expiry)")
+    except Exception as e:
+        logger.error("Token refresh failed: {}", e)
+        await notify.send(f"❌ Domcity Planner: token refresh failed\n{e}")
+
+
 def next_class_datetime(rule: AutomationRule, now: datetime | None = None) -> datetime:
     """The next tz-aware datetime when a class matching this rule should occur,
     based only on day_of_week + time_of_day. Used as a hint when looking up the
