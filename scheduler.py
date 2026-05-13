@@ -19,29 +19,50 @@ import pushpress
 from models import AutomationRule, BookingAttempt, engine
 from settings import settings
 
-MAX_RETRIES = 10
+MAX_RETRIES = 5                 # transient retries only (network / 5xx)
 RETRY_DELAY_SEC = 30
-LOOKAHEAD_DAYS = 14  # how far ahead to search for a class matching a rule
+LOOKAHEAD_DAYS = 14
+POLL_INTERVAL_HOURS = 12        # check twice a day for "class full" rules
+MIN_HOURS_BEFORE_CLASS = 1      # stop polling this close to class start
 
-# Substrings in a PushPress error message that signal there's no point retrying:
-# the booking will keep failing for the same reason. Match case-insensitively.
-TERMINAL_ERROR_KEYWORDS = (
-    "exceeded",          # "Exceeded registration cap"
+# Substrings that mean the SLOT is full but could open up if someone cancels.
+# These rules switch into 12-hour polling mode instead of fast-retrying.
+CLASS_FULL_KEYWORDS = (
+    "class is full",
+    "fully booked",
+    "no spots",
+    "no spot available",
+    "no available spots",
+    "sold out",
+    "no longer available",
+    "capacity",          # "at capacity", "capacity reached"
+    "no space",
+    "waitlist",          # if returned as an error, treat as full
+)
+
+# Substrings about the USER's account — retrying won't help no matter how long.
+USER_TERMINAL_KEYWORDS = (
+    "exceeded",
     "registration cap",
-    "already",           # "Already reserved"
+    "already",           # already reserved this class
     "no permission",
     "not authorized",
-    "membership",        # "No active membership"
-    "subscription",      # "Subscription is not active"
+    "membership",
+    "subscription",
     "expired",
-    "cancelled",
+    "cancelled",         # class was cancelled by gym
     "not allowed",
 )
 
 
-def _is_terminal_error(msg: str) -> bool:
+def _is_class_full(msg: str) -> bool:
     low = (msg or "").lower()
-    return any(kw in low for kw in TERMINAL_ERROR_KEYWORDS)
+    return any(kw in low for kw in CLASS_FULL_KEYWORDS)
+
+
+def _is_user_terminal(msg: str) -> bool:
+    low = (msg or "").lower()
+    return any(kw in low for kw in USER_TERMINAL_KEYWORDS)
 
 _scheduler: AsyncIOScheduler | None = None
 
@@ -217,7 +238,11 @@ async def next_window_open_async(rule: AutomationRule) -> datetime | None:
 
 
 async def booking_window_job(rule_id: int, attempt: int) -> None:
-    """One-shot job: try to book the next matching class. Retry on failure."""
+    """One-shot job: try to book the next matching class. Branches:
+      - success → log + notify + schedule next week's class
+      - class full → switch to 12h poll mode (no spamming)
+      - user-terminal error (cap exceeded etc) → log + give up + next week
+      - transient → retry every 30s up to MAX_RETRIES"""
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
         if not rule or not rule.enabled:
@@ -229,19 +254,148 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
     logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
 
     if not slot:
-        return await _handle_failure(rule, attempt, target_label, "no matching class found")
+        return await _handle_failure(rule, attempt, target_label, "no matching class found", slot=None)
+
+    # If the class is already full at window-open, skip the booking attempt
+    # entirely and start polling for an opening.
+    if (slot.spots_available or 0) <= 0:
+        return await _start_polling(
+            rule, slot, target_label, f"class full at window open ({slot.spots_available}/{slot.spots_total})"
+        )
 
     try:
         result = await pushpress.book(slot.id)
     except Exception as e:
-        return await _handle_failure(rule, attempt, target_label, f"book call raised: {e}")
+        return await _handle_failure(rule, attempt, target_label, f"book call raised: {e}", slot=slot)
     if result.ok:
         _record(rule.id, target_label, "success", result.message or "booked")
         await notify.send(f"✅ Booked: {target_label}")
         # Re-schedule for the FOLLOWING week (look past the slot we just booked).
         await _schedule_after(rule, slot.start.astimezone(tz()) + timedelta(minutes=1))
     else:
-        await _handle_failure(rule, attempt, target_label, result.message)
+        await _handle_failure(rule, attempt, target_label, result.message, slot=slot)
+
+
+async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
+    """Periodic check: did a spot open up for the full class this rule wants?
+    Fires every POLL_INTERVAL_HOURS hours, stops MIN_HOURS_BEFORE_CLASS before
+    class start."""
+    with DbSession(engine) as db:
+        rule = db.get(AutomationRule, rule_id)
+        if not rule or not rule.enabled:
+            logger.info("Rule {} missing or disabled, stopping poll", rule_id)
+            return
+
+    today = datetime.now(tz()).date()
+    try:
+        classes = await pushpress.list_schedule(today, today + timedelta(days=LOOKAHEAD_DAYS))
+    except Exception as e:
+        logger.warning("Poll fetch failed for rule {}: {}", rule_id, e)
+        # Try again next interval against a stale slot dummy
+        await _schedule_poll_retry(rule_id, calendar_item_uuid)
+        return
+
+    slot = next((c for c in classes if c.id == calendar_item_uuid), None)
+    if slot is None:
+        # Class has vanished — gym cancelled it, or it scrolled past the
+        # lookahead window. Either way, move on to next week's class.
+        label = f"{rule.name} (cal {calendar_item_uuid[:20]}…)"
+        _record(rule.id, label, "failure", "class no longer on schedule")
+        await notify.send(f"❌ {rule.name}: target class disappeared from the schedule")
+        await _schedule_after(rule, datetime.now(tz()) + timedelta(hours=1))
+        return
+
+    class_start = slot.start.astimezone(tz())
+    now = datetime.now(tz())
+    label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
+
+    if class_start <= now:
+        _record(rule.id, label, "failure", "class started, never got a spot")
+        await notify.send(f"❌ {rule.name}: class started, never got a spot")
+        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        return
+
+    spots = slot.spots_available or 0
+    if spots <= 0:
+        # Still full — log + reschedule the next poll.
+        _record(rule.id, label, "polling", f"still full ({spots}/{slot.spots_total})")
+        logger.info("Rule {} poll: still full ({}/{})", rule_id, spots, slot.spots_total)
+        return await _schedule_poll(rule, slot)
+
+    # Spot opened up — race to book it.
+    logger.info("Rule {} poll: spot opened ({}/{}), attempting book", rule_id, spots, slot.spots_total)
+    try:
+        result = await pushpress.book(slot.id)
+    except Exception as e:
+        logger.warning("Book during poll raised: {}", e)
+        return await _schedule_poll(rule, slot)
+
+    if result.ok:
+        _record(rule.id, label, "success", "booked from poll")
+        await notify.send(f"✅ Booked from poll: {label}")
+        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        return
+
+    # Someone took it first / different error
+    if _is_user_terminal(result.message):
+        _record(rule.id, label, "failure", f"terminal during poll: {result.message}")
+        await notify.send(f"❌ Poll booking failed (terminal): {label}\n{result.message}")
+        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        return
+    # Race lost, or some other recoverable error — keep polling
+    _record(rule.id, label, "polling", f"poll race lost: {result.message}")
+    await _schedule_poll(rule, slot)
+
+
+async def _start_polling(rule: AutomationRule, slot, label: str, reason: str) -> None:
+    _record(rule.id, label, "polling", reason)
+    await notify.send(
+        f"⏳ {rule.name}: class is full, polling every {POLL_INTERVAL_HOURS}h for an opening"
+    )
+    await _schedule_poll(rule, slot)
+
+
+async def _schedule_poll(rule: AutomationRule, slot) -> None:
+    """Schedule the next poll for this rule's target class, or give up if we're
+    too close to class start to keep trying."""
+    sch = get_scheduler()
+    now = datetime.now(tz())
+    class_start = slot.start.astimezone(tz())
+    next_poll = now + timedelta(hours=POLL_INTERVAL_HOURS)
+    deadline = class_start - timedelta(hours=MIN_HOURS_BEFORE_CLASS)
+    if next_poll > deadline:
+        # Out of time. Final failure, advance to next week.
+        label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
+        _record(rule.id, label, "failure", "class stayed full through booking window")
+        await notify.send(f"❌ {rule.name}: class stayed full, never got a spot")
+        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        return
+    sch.add_job(
+        class_full_poll_job,
+        "date",
+        run_date=next_poll,
+        args=[rule.id, slot.id],
+        id=f"rule-{rule.id}-poll",
+        replace_existing=True,
+        misfire_grace_time=60 * 30,
+    )
+    logger.info(
+        "Polling rule {} ('{}') again at {} for class {}",
+        rule.id, rule.name, next_poll.isoformat(), slot.id,
+    )
+
+
+async def _schedule_poll_retry(rule_id: int, calendar_item_uuid: str) -> None:
+    """Short retry when the periodic fetch itself errored — try again in 1h."""
+    sch = get_scheduler()
+    sch.add_job(
+        class_full_poll_job,
+        "date",
+        run_date=datetime.now(tz()) + timedelta(hours=1),
+        args=[rule_id, calendar_item_uuid],
+        id=f"rule-{rule_id}-poll",
+        replace_existing=True,
+    )
 
 
 async def _schedule_after(rule: AutomationRule, after: datetime) -> None:
@@ -272,15 +426,27 @@ async def _schedule_after(rule: AutomationRule, after: datetime) -> None:
     )
 
 
-async def _handle_failure(rule: AutomationRule, attempt: int, label: str, msg: str) -> None:
+async def _handle_failure(
+    rule: AutomationRule, attempt: int, label: str, msg: str, slot=None
+) -> None:
     logger.warning("Rule {} attempt {} failed: {}", rule.id, attempt + 1, msg)
-    terminal = _is_terminal_error(msg)
-    if terminal or attempt + 1 >= MAX_RETRIES:
-        status = "failure" if terminal else "failure"
-        reason = f"terminal: {msg}" if terminal else msg
-        _record(rule.id, label, status, reason)
-        await notify.send(f"❌ Failed ({'terminal' if terminal else 'gave up'}): {label}\n{msg}")
-        # Try again next week
+
+    # Class-full → switch to 12h poll mode (only if we know which slot)
+    if slot is not None and _is_class_full(msg):
+        await _start_polling(rule, slot, label, msg)
+        return
+
+    # User-side terminal → give up + next week
+    if _is_user_terminal(msg):
+        _record(rule.id, label, "failure", f"terminal: {msg}")
+        await notify.send(f"❌ Failed (terminal): {label}\n{msg}")
+        await _schedule_after(rule, datetime.now(tz()) + timedelta(hours=1))
+        return
+
+    # Transient → retry every 30s up to MAX_RETRIES
+    if attempt + 1 >= MAX_RETRIES:
+        _record(rule.id, label, "failure", msg)
+        await notify.send(f"❌ Failed (gave up after {MAX_RETRIES} retries): {label}\n{msg}")
         await _schedule_after(rule, datetime.now(tz()) + timedelta(hours=1))
         return
     _record(rule.id, label, "retry", msg)
