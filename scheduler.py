@@ -178,22 +178,24 @@ async def reminder_day_job(reservation_id: str) -> None:
     r = await _active_reservation(reservation_id)
     if not r:
         return
-    start_local = r.start.astimezone(tz())
-    msg = f"📅 Today at {start_local.strftime('%H:%M')}: {r.class_name}"
-    if r.instructor:
-        msg += f"\n👤 {r.instructor}"
-    await notify.send(msg)
+    await notify.send(_reminder_message("📅 Today", r))
 
 
 async def reminder_pre_job(reservation_id: str) -> None:
     r = await _active_reservation(reservation_id)
     if not r:
         return
+    await notify.send(_reminder_message(f"⏰ Starts in {REMINDER_PRE_MIN} min", r))
+
+
+def _reminder_message(prefix: str, r) -> str:
     start_local = r.start.astimezone(tz())
-    msg = f"⏰ Starts in {REMINDER_PRE_MIN} min ({start_local.strftime('%H:%M')}): {r.class_name}"
+    lines = [f"{prefix} at {start_local.strftime('%H:%M')}: {r.class_name}"]
+    if r.location:
+        lines.append(f"📍 {r.location}")
     if r.instructor:
-        msg += f"\n👤 {r.instructor}"
-    await notify.send(msg)
+        lines.append(f"👤 {r.instructor}")
+    return "\n".join(lines)
 
 
 async def _active_reservation(reservation_id: str):

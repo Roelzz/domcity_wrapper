@@ -13,6 +13,7 @@
           <div>
             <strong>{{ r.class_name }}</strong>
             <p class="muted">{{ r.start.strftime('%a %d %b · %H:%M') }}–{{ r.end.strftime('%H:%M') }}</p>
+            {% if r.location %}<p class="muted">📍 {{ r.location }}</p>{% endif %}
             {% if r.instructor %}<p class="muted">👤 {{ r.instructor }}</p>{% endif %}
           </div>
           <div>

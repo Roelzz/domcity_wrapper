@@ -64,6 +64,7 @@ class Reservation(BaseModel):
     id: str  # reservation uuid
     class_id: str
     class_name: str
+    location: str = ""
     start: datetime
     end: datetime
     instructor: str | None = None
@@ -549,12 +550,14 @@ def _to_reservation(r: dict) -> Reservation:
     ci = r.get("calendarItem") or {}
     coach = ci.get("mainCoach") or {}
     coach_name = " ".join(x for x in [coach.get("firstName"), coach.get("lastName")] if x) or None
+    location = (ci.get("location") or {}).get("name") or ""
     status = (r.get("rawStatus") or "").lower()
     cancellable = bool(r.get("isActive")) and not r.get("isCancelled") and status not in {"attended", "no_show"}
     return Reservation(
         id=r["uuid"],
         class_id=r.get("calendarItemUuid") or "",
         class_name=r.get("reservationTitle") or "Class",
+        location=location,
         start=_parse_dt(r.get("rawStartTime") or r.get("reservationStart")),
         end=_parse_dt(r.get("rawEndTime") or r.get("reservationEnd")),
         instructor=coach_name,
@@ -616,6 +619,7 @@ query GetUpcomingReservations {
     rawEndTime: reservationEnd
     rawStatus: status
     calendarItem {
+      location { name __typename }
       mainCoach { firstName lastName __typename }
       __typename
     }
