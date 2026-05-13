@@ -453,11 +453,24 @@ async def _gql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
 
 
 def _parse_dt(v: Any) -> datetime:
+    """Parse a PushPress datetime string.
+
+    PushPress serialises class times with a `Z`/`+00:00` suffix, but the
+    digits are actually the gym's local wall-clock time — NOT UTC. (Verified
+    against booked classes that came back at the local-clock hour despite
+    being tagged as +00:00.) We strip the misleading UTC suffix and
+    re-attach the configured local zone so all comparisons + display work
+    correctly.
+    """
+    from zoneinfo import ZoneInfo
     if isinstance(v, datetime):
-        return v
-    if isinstance(v, str):
-        return datetime.fromisoformat(v.replace("Z", "+00:00"))
-    raise ValueError(f"Cannot parse datetime: {v!r}")
+        dt = v
+    elif isinstance(v, str):
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    else:
+        raise ValueError(f"Cannot parse datetime: {v!r}")
+    # Treat the wall-clock as local time at the gym.
+    return dt.replace(tzinfo=ZoneInfo(settings.tz))
 
 
 def _to_slot(c: dict) -> ClassSlot:
