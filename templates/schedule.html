@@ -1,44 +1,102 @@
 {% extends "base.html" %}
 {% block title %}Schedule · Domcity Planner{% endblock %}
+
+{# Helper macros for building toggle URLs #}
+{% macro toggle_url(kind, value) -%}
+{%- set sel = selected_locations if kind == 'locations' else selected_categories -%}
+{%- if value in sel -%}
+  {%- set new = sel | reject('equalto', value) | list -%}
+{%- else -%}
+  {%- set new = (sel | list) + [value] -%}
+{%- endif -%}
+{%- set other_kind = 'categories' if kind == 'locations' else 'locations' -%}
+{%- set other_sel = selected_categories if kind == 'locations' else selected_locations -%}
+{%- set params = [] -%}
+{%- if new -%}{%- set _ = params.append(kind ~ '=' ~ (new | join(','))) -%}{%- endif -%}
+{%- if other_sel -%}{%- set _ = params.append(other_kind ~ '=' ~ (other_sel | join(','))) -%}{%- endif -%}
+{%- set _ = params.append('start=' ~ start.isoformat()) -%}
+/schedule?{{ params | join('&') }}
+{%- endmacro %}
+
 {% block content %}
 <section>
   <header class="page-head">
     <h2>Schedule</h2>
     <div class="date-nav">
-      <a role="button" class="secondary" href="/schedule?date={{ prev_date }}">←</a>
-      <span class="week-label">Week of {{ start.strftime('%a %d %b %Y') }}</span>
-      <a role="button" class="secondary" href="/schedule?date={{ next_date }}">→</a>
+      <a role="button" class="secondary" href="/schedule?start={{ prev_start }}{% if filters_qs %}&{{ filters_qs }}{% endif %}">←</a>
+      <span class="week-label">
+        Week of {{ start.strftime('%a %d %b %Y') }}
+      </span>
+      <a role="button" class="secondary" href="/schedule?start={{ next_start }}{% if filters_qs %}&{{ filters_qs }}{% endif %}">→</a>
+      {% if start.isoformat() != today_start %}
+        <a role="button" class="secondary outline small" href="/schedule?start={{ today_start }}{% if filters_qs %}&{{ filters_qs }}{% endif %}">Today</a>
+      {% endif %}
     </div>
   </header>
 
-  {% if not classes %}
-    <p class="muted">No classes found for this week.</p>
-  {% else %}
-    <div class="class-grid">
-      {% for c in classes %}
-        <article class="class-card">
-          <header>
-            <strong>{{ c.name }}</strong>
-            <span class="muted">{{ c.start.strftime('%a %d %b · %H:%M') }}–{{ c.end.strftime('%H:%M') }}</span>
-          </header>
-          {% if c.instructor %}<p class="muted">👤 {{ c.instructor }}</p>{% endif %}
-          {% if c.spots_available is not none and c.spots_total %}
-            <p class="muted">{{ c.spots_available }} / {{ c.spots_total }} spots</p>
-          {% endif %}
-          <footer>
-            {% if c.booked %}
-              <span class="success">Booked ✓</span>
-            {% elif c.spots_available == 0 %}
-              <button class="secondary" disabled>Full</button>
-            {% else %}
-              <button hx-post="/schedule/book/{{ c.id }}"
-                      hx-swap="outerHTML"
-                      hx-disabled-elt="this">Book</button>
-            {% endif %}
-          </footer>
-        </article>
+  <div class="filters">
+    <div class="filter-row">
+      <span class="filter-label">Location</span>
+      <a class="chip {% if not selected_locations %}active{% endif %}"
+         href="/schedule?start={{ start.isoformat() }}{% if selected_categories %}&categories={{ selected_categories | join(',') }}{% endif %}">All</a>
+      {% for loc in all_locations %}
+        <a class="chip {% if loc in selected_locations %}active{% endif %}"
+           href="{{ toggle_url('locations', loc) }}">{{ loc }}</a>
       {% endfor %}
     </div>
-  {% endif %}
+    <div class="filter-row">
+      <span class="filter-label">Training</span>
+      <a class="chip {% if not selected_categories %}active{% endif %}"
+         href="/schedule?start={{ start.isoformat() }}{% if selected_locations %}&locations={{ selected_locations | join(',') }}{% endif %}">All</a>
+      {% for cat in all_categories %}
+        <a class="chip {% if cat in selected_categories %}active{% endif %}"
+           href="{{ toggle_url('categories', cat) }}">{{ cat }}</a>
+      {% endfor %}
+    </div>
+    <p class="muted filter-summary">{{ total_count }} of {{ unfiltered_count }} classes shown</p>
+  </div>
+
+  <div class="day-grid">
+    {% for day in days %}
+      <article class="day-col{% if day.is_today %} today{% endif %}">
+        <header class="day-header">
+          <strong>{{ day.label_short }}</strong>
+          <span class="muted">{{ day.date.strftime('%d %b') }}</span>
+          {% if day.is_today %}<span class="badge">today</span>{% endif %}
+        </header>
+        {% if not day.classes %}
+          <p class="muted empty">—</p>
+        {% else %}
+          {% for c in day.classes %}
+            <article class="class-card{% if c.booked %} booked{% endif %}{% if c.spots_available == 0 %} full{% endif %}">
+              <div class="class-time">{{ c.start.strftime('%H:%M') }}–{{ c.end.strftime('%H:%M') }}</div>
+              <div class="class-title">{{ c.name }}</div>
+              <div class="class-meta">
+                {% if c.location_code %}<span class="tag loc">{{ c.location_code }}</span>{% endif %}
+                <span class="tag cat">{{ c.category }}</span>
+                {% if c.spots_available is not none and c.spots_total %}
+                  <span class="muted spots">{{ c.spots_available }}/{{ c.spots_total }}</span>
+                {% endif %}
+              </div>
+              {% if c.instructor %}<div class="muted small">👤 {{ c.instructor }}</div>{% endif %}
+              <div class="class-actions">
+                {% if c.booked %}
+                  <span class="success small">Booked ✓</span>
+                {% elif c.spots_available == 0 %}
+                  <span class="muted small">Full</span>
+                {% else %}
+                  <button class="primary small"
+                          hx-post="/schedule/book/{{ c.id }}"
+                          hx-swap="outerHTML"
+                          hx-disabled-elt="this">Book</button>
+                {% endif %}
+                <a class="secondary outline small" href="/automation/from-class/{{ c.id }}" title="Create a recurring automation from this class">⚡ Automate</a>
+              </div>
+            </article>
+          {% endfor %}
+        {% endif %}
+      </article>
+    {% endfor %}
+  </div>
 </section>
 {% endblock %}

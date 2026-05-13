@@ -42,6 +42,9 @@ CALENDAR_SESSION_TYPE_ID = 2
 class ClassSlot(BaseModel):
     id: str  # calendarItemUuid
     name: str
+    location: str = ""           # e.g. "Havenweg 6"
+    location_code: str = ""      # e.g. "HW" (parsed from title prefix)
+    category: str = ""           # e.g. "Classic CrossFit" (parsed from title)
     start: datetime
     end: datetime
     instructor: str | None = None
@@ -244,17 +247,73 @@ def _parse_dt(v: Any) -> datetime:
 def _to_slot(c: dict) -> ClassSlot:
     coach = c.get("mainCoach") or {}
     coach_name = " ".join(x for x in [coach.get("firstName"), coach.get("lastName")] if x) or None
+    location = (c.get("location") or {}).get("name") or ""
+    title = c.get("title") or "Class"
+    code, category = parse_title(title)
     return ClassSlot(
         id=c["uuid"],
-        name=c.get("title") or "Class",
+        name=title,
+        location=location,
+        location_code=code,
+        category=category,
         start=_parse_dt(c.get("startTime") or c.get("startDatetime")),
         end=_parse_dt(c.get("endTime") or c.get("endDatetime")),
         instructor=coach_name,
         spots_available=c.get("spotsAvailable"),
         spots_total=c.get("attendanceCap"),
-        booked=False,  # GetClasses doesn't expose this directly; cross-ref via reservations
+        booked=False,  # cross-ref via reservations
         registration_start_offset_min=c.get("registrationStartOffset"),
     )
+
+
+# Known category roots — extend as new ones appear. The parser picks the
+# longest prefix that matches one of these against the post-pipe segment.
+_KNOWN_CATEGORIES = (
+    "Classic CrossFit",
+    "Functional CrossFit",
+    "Hyrox Open",
+    "Open Gym",
+    "Trial Class",
+    "Trial class",
+)
+
+
+def parse_title(title: str) -> tuple[str, str]:
+    """Return (location_code, category) parsed from a PushPress class title.
+
+    Examples:
+      "OV | Classic CrossFit"                  -> ("OV", "Classic CrossFit")
+      "HW | Open Gym Back Hall 6"              -> ("HW", "Open Gym")
+      "Trial Class | Kanaalweg 29c"            -> ("",   "Trial Class")
+      "Trial class | CrossFit | Overste den…"  -> ("",   "Trial Class")
+    """
+    parts = [p.strip() for p in title.split("|")]
+    if not parts:
+        return "", ""
+    head = parts[0]
+    rest = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    # Trial classes don't have a location code prefix
+    if head.lower().startswith("trial"):
+        return "", "Trial Class"
+
+    # Treat the first segment as the location code if it's short uppercase
+    if len(head) <= 4 and head.isupper():
+        code = head
+        candidate = rest
+    else:
+        code = ""
+        candidate = title  # whole title
+
+    cat = ""
+    for known in _KNOWN_CATEGORIES:
+        if candidate.lower().startswith(known.lower()):
+            cat = known.title() if known.islower() else known
+            break
+    if not cat:
+        # fall back to first two words of candidate
+        cat = " ".join(candidate.split()[:2]) or candidate
+    return code, cat
 
 
 def _to_reservation(r: dict) -> Reservation:
@@ -308,6 +367,7 @@ query GetClasses($classDate: Date!) {
     registrationEndOffset
     startTime: startDatetime
     endTime: endDatetime
+    location { name __typename }
     mainCoach { firstName lastName __typename }
     __typename
   }

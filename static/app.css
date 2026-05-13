@@ -1,12 +1,13 @@
 :root {
-  --pico-font-size: 16px;
+  --pico-font-size: 15px;
   --accent: #ff7849;
 }
 
-header nav { padding-block: .6rem; }
+/* ---------- Nav ---------- */
+header nav { padding-block: .5rem; }
 header nav .nav-links { display: flex; gap: .25rem; align-items: center; flex-wrap: wrap; }
 header nav .nav-links a {
-  padding: .4rem .8rem;
+  padding: .35rem .75rem;
   border-radius: var(--pico-border-radius);
   text-decoration: none;
 }
@@ -15,6 +16,7 @@ header nav .nav-links a.active {
   color: var(--pico-primary-inverse);
 }
 
+/* ---------- Page head ---------- */
 .page-head {
   display: flex;
   justify-content: space-between;
@@ -25,17 +27,136 @@ header nav .nav-links a.active {
 }
 .page-head h2 { margin: 0; }
 
-.date-nav { display: flex; gap: .5rem; align-items: center; }
+.date-nav { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .date-nav .week-label { font-weight: 600; }
 
-.class-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 1rem;
+/* ---------- Filter chips ---------- */
+.filters {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--pico-muted-border-color);
 }
-.class-card header { display: flex; flex-direction: column; gap: .25rem; }
-.class-card footer { margin-top: .75rem; }
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .35rem;
+}
+.filter-label {
+  font-size: .75rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--pico-muted-color);
+  min-width: 5.5em;
+}
+.chip {
+  display: inline-block;
+  padding: .25rem .7rem;
+  border-radius: 999px;
+  border: 1px solid var(--pico-muted-border-color);
+  background: transparent;
+  color: var(--pico-color);
+  font-size: .85rem;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background 100ms ease;
+}
+.chip:hover { background: var(--pico-muted-border-color); }
+.chip.active {
+  background: var(--pico-primary-background);
+  color: var(--pico-primary-inverse);
+  border-color: var(--pico-primary-background);
+}
+.filter-summary { font-size: .8rem; margin: 0; }
 
+/* ---------- Day grid ---------- */
+.day-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: .75rem;
+}
+.day-col {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  padding: .5rem;
+  background: var(--pico-card-background-color);
+  border-radius: var(--pico-border-radius);
+  border: 1px solid var(--pico-muted-border-color);
+  min-height: 5rem;
+}
+.day-col.today { border-color: var(--pico-primary-background); box-shadow: 0 0 0 2px var(--pico-primary-background) inset; }
+.day-header {
+  display: flex;
+  flex-direction: column;
+  gap: .15rem;
+  padding-bottom: .35rem;
+  border-bottom: 1px solid var(--pico-muted-border-color);
+  position: sticky;
+  top: 0;
+  background: var(--pico-card-background-color);
+  z-index: 1;
+}
+.day-header strong { font-size: .95rem; }
+.day-header .badge {
+  display: inline-block;
+  font-size: .65rem;
+  background: var(--pico-primary-background);
+  color: var(--pico-primary-inverse);
+  padding: 1px 6px;
+  border-radius: 999px;
+  align-self: flex-start;
+  margin-top: 2px;
+}
+.empty { text-align: center; opacity: .4; margin: 1rem 0; }
+
+/* ---------- Class card (in column) ---------- */
+.class-card {
+  display: flex;
+  flex-direction: column;
+  gap: .25rem;
+  padding: .55rem .6rem;
+  background: var(--pico-background-color);
+  border: 1px solid var(--pico-muted-border-color);
+  border-radius: var(--pico-border-radius);
+  font-size: .85rem;
+}
+.class-card.booked { border-color: var(--pico-color-green-550); background: color-mix(in srgb, var(--pico-color-green-100) 40%, transparent); }
+.class-card.full { opacity: .55; }
+.class-time { font-weight: 700; font-size: .9rem; }
+.class-title { font-size: .85rem; line-height: 1.25; word-break: break-word; }
+.class-meta { display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; margin-top: .15rem; }
+.tag {
+  display: inline-block;
+  font-size: .65rem;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--pico-muted-border-color);
+  white-space: nowrap;
+}
+.tag.loc { background: color-mix(in srgb, var(--pico-primary-background) 20%, transparent); }
+.tag.cat { background: color-mix(in srgb, var(--pico-color-orange-550) 18%, transparent); }
+.spots { font-size: .75rem; }
+
+.class-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .25rem;
+  margin-top: .35rem;
+}
+.class-actions > * { font-size: .75rem; padding: .25rem .5rem; }
+
+/* ---------- Mobile: stack days vertically ---------- */
+@media (max-width: 900px) {
+  .day-grid { grid-template-columns: 1fr; }
+  .day-col { min-height: auto; }
+  .day-header { position: relative; }
+}
+
+/* ---------- Reservation list ---------- */
 .reservation-list { display: flex; flex-direction: column; gap: .5rem; }
 .reservation-row {
   display: flex;
@@ -45,13 +166,16 @@ header nav .nav-links a.active {
   flex-wrap: wrap;
 }
 
+/* ---------- Automation form ---------- */
 .rule-form .row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: .75rem;
 }
 
+/* ---------- Common ---------- */
 .muted { color: var(--pico-muted-color); margin: 0; }
+.muted.small { font-size: .75rem; }
 .success { color: var(--pico-color-green-550); font-weight: 600; }
 .error   { color: var(--pico-color-red-550);  font-weight: 600; }
 .warn    { color: var(--pico-color-orange-550); font-weight: 600; }
@@ -67,7 +191,7 @@ header nav .nav-links a.active {
   color: var(--pico-color-orange-800);
 }
 
-button.small, [role=button].small { padding: .25rem .6rem; font-size: .85rem; }
+button.small, [role=button].small, a.small { padding: .25rem .55rem; font-size: .8rem; }
 
 .login-wrap { max-width: 420px; margin-top: 8vh; }
 

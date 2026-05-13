@@ -13,10 +13,12 @@ engine = create_engine(settings.database_url, echo=False)
 
 class AutomationRule(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    class_name_pattern: str
+    name: str
+    location: str
+    class_category: str
     day_of_week: int  # 0=Mon ... 6=Sun
     time_of_day: time
-    lead_time_hours: int = 24
+    lead_time_hours: int = 336  # 14 days
     enabled: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
 

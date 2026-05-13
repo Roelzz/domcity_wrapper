@@ -115,7 +115,7 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
             return
 
     class_dt = next_class_datetime(rule)
-    target_label = f"{rule.class_name_pattern} @ {class_dt.isoformat()}"
+    target_label = f"{rule.name} ({rule.class_category} @ {rule.location}) — {class_dt.isoformat()}"
     logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
 
     try:
@@ -123,7 +123,7 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
     except Exception as e:
         return await _handle_failure(rule, attempt, target_label, f"schedule fetch failed: {e}")
 
-    slot = _match_slot(slots, rule.class_name_pattern, class_dt)
+    slot = _match_slot(slots, rule, class_dt)
     if not slot:
         return await _handle_failure(rule, attempt, target_label, "no matching class slot found")
     try:
@@ -138,12 +138,17 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
         await _handle_failure(rule, attempt, target_label, result.message)
 
 
-def _match_slot(slots, pattern: str, when: datetime):
-    pat = pattern.lower()
+def _match_slot(slots, rule: AutomationRule, when: datetime):
     when_min = when - timedelta(minutes=30)
     when_max = when + timedelta(minutes=30)
+    cat = rule.class_category.lower()
+    loc = rule.location.lower()
     for s in slots:
-        if pat in s.name.lower() and when_min <= s.start.astimezone(tz()) <= when_max:
+        if loc and s.location.lower() != loc:
+            continue
+        if cat and s.category.lower() != cat:
+            continue
+        if when_min <= s.start.astimezone(tz()) <= when_max:
             return s
     return None
 
