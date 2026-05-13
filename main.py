@@ -131,6 +131,15 @@ async def schedule_page(
         and (not cat_filter or c.category in cat_filter)
     ]
 
+    # Compute booking-window-open hints for each class. If the window is in
+    # the future, the card shows "Opens in 3d 14h" instead of a Book button.
+    now_local = datetime.now(scheduler.tz())
+    window_hints: dict[str, str] = {}
+    for c in filtered:
+        opens_at = scheduler.window_open_time(c)
+        if opens_at > now_local:
+            window_hints[c.id] = _humanize_until(opens_at - now_local)
+
     by_day = defaultdict(list)
     for c in filtered:
         by_day[c.start.date()].append(c)
@@ -157,6 +166,7 @@ async def schedule_page(
         "selected_locations": loc_filter,
         "selected_categories": cat_filter,
         "filters_qs": _filter_query(loc_filter, cat_filter),
+        "window_hints": window_hints,
         "total_count": len(filtered),
         "unfiltered_count": len(all_classes),
         "error": err,
@@ -476,6 +486,22 @@ def _parse_date(s: str | None) -> date | None:
 
 def _monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
+
+
+def _humanize_until(delta: timedelta) -> str:
+    """'3d 14h' / '4h 12m' / '47m'. Always rounds toward zero of the smaller
+    unit so the displayed time never overstates how much remains."""
+    total = int(delta.total_seconds())
+    if total <= 0:
+        return "now"
+    days, total = divmod(total, 86400)
+    hours, total = divmod(total, 3600)
+    minutes = total // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _split_csv(s: str | None) -> list[str]:

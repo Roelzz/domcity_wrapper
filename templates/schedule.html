@@ -86,6 +86,9 @@
                 {% endif %}
               </div>
               {% if c.instructor %}<div class="muted small">👤 {{ c.instructor }}</div>{% endif %}
+              {% if window_hints.get(c.id) %}
+                <div class="muted small window-hint">⏳ Opens in {{ window_hints[c.id] }}</div>
+              {% endif %}
               <div class="class-actions">
                 {% if c.booked %}
                   <span class="success small">Booked ✓</span>
