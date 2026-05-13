@@ -1,0 +1,39 @@
+[project]
+name = "domcity-planner"
+version = "0.1.0"
+description = "Self-hosted wrapper around members.pushpress.com with class-booking automation"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "sqlmodel>=0.0.22",
+    "apscheduler>=3.10",
+    "cryptography>=43",
+    "itsdangerous>=2.2",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "loguru>=0.7",
+    "python-multipart>=0.0.20",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

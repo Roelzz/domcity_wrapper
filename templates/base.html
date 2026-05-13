@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a1a2e" />
+  <title>{% block title %}Domcity Planner{% endblock %}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+  <link rel="stylesheet" href="/static/app.css" />
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+  <header class="container">
+    <nav>
+      <ul>
+        <li><strong>🏛 Domcity Planner</strong></li>
+      </ul>
+      <ul class="nav-links">
+        <li><a href="/schedule" class="{% if active == 'schedule' %}active{% endif %}">Schedule</a></li>
+        <li><a href="/reservations" class="{% if active == 'reservations' %}active{% endif %}">Reservations</a></li>
+        <li><a href="/automation" class="{% if active == 'automation' %}active{% endif %}">Automation</a></li>
+        <li>
+          <form method="post" action="/logout" style="display:inline">
+            <button type="submit" class="secondary outline small">Logout</button>
+          </form>
+        </li>
+      </ul>
+    </nav>
+  </header>
+  <main class="container">
+    {% if error %}<article class="error-box">⚠️ {{ error }}</article>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="container">
+    <small>Domcity Planner · self-hosted on Coolify · members.pushpress.com wrapper</small>
+  </footer>
+</body>
+</html>

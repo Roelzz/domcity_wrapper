@@ -1,0 +1,72 @@
+:root {
+  --pico-font-size: 16px;
+  --accent: #ff7849;
+}
+
+header nav { padding-block: .6rem; }
+header nav .nav-links { display: flex; gap: .25rem; align-items: center; flex-wrap: wrap; }
+header nav .nav-links a {
+  padding: .4rem .8rem;
+  border-radius: var(--pico-border-radius);
+  text-decoration: none;
+}
+header nav .nav-links a.active {
+  background: var(--pico-primary-background);
+  color: var(--pico-primary-inverse);
+}
+
+.page-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.page-head h2 { margin: 0; }
+
+.date-nav { display: flex; gap: .5rem; align-items: center; }
+.date-nav .week-label { font-weight: 600; }
+
+.class-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+.class-card header { display: flex; flex-direction: column; gap: .25rem; }
+.class-card footer { margin-top: .75rem; }
+
+.reservation-list { display: flex; flex-direction: column; gap: .5rem; }
+.reservation-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.rule-form .row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: .75rem;
+}
+
+.muted { color: var(--pico-muted-color); margin: 0; }
+.success { color: var(--pico-color-green-550); font-weight: 600; }
+.error   { color: var(--pico-color-red-550);  font-weight: 600; }
+.warn    { color: var(--pico-color-orange-550); font-weight: 600; }
+
+.error-box {
+  background: var(--pico-color-red-100);
+  border-left: 4px solid var(--pico-color-red-550);
+  color: var(--pico-color-red-800);
+}
+
+button.small, [role=button].small { padding: .25rem .6rem; font-size: .85rem; }
+
+.login-wrap { max-width: 420px; margin-top: 8vh; }
+
+@media (max-width: 640px) {
+  header nav { flex-direction: column; align-items: flex-start; }
+  header nav .nav-links { width: 100%; }
+}

@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Automation · Domcity Planner{% endblock %}
+{% set days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] %}
+{% block content %}
+<section>
+  <header class="page-head"><h2>Automation</h2></header>
+
+  <article>
+    <header><strong>New rule</strong></header>
+    <p class="muted">Fires the moment the booking window opens for a recurring weekly class.</p>
+    <form method="post" action="/automation" class="rule-form">
+      <label>
+        Class name (substring match)
+        <input name="class_name_pattern" placeholder="e.g. Strength" required />
+      </label>
+      <div class="row">
+        <label>
+          Day
+          <select name="day_of_week" required>
+            {% for d in days %}<option value="{{ loop.index0 }}">{{ d }}</option>{% endfor %}
+          </select>
+        </label>
+        <label>
+          Class time
+          <input type="time" name="time_of_day" required value="17:00" />
+        </label>
+        <label>
+          Booking opens (hours ahead)
+          <input type="number" name="lead_time_hours" min="1" max="168" value="24" required />
+        </label>
+      </div>
+      <button type="submit">Add rule</button>
+    </form>
+  </article>
+
+  <article>
+    <header><strong>Active rules</strong></header>
+    {% if not rules %}
+      <p class="muted">No rules yet.</p>
+    {% else %}
+      <table>
+        <thead>
+          <tr><th>Class</th><th>When</th><th>Window opens</th><th>Next fire</th><th></th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for r in rules %}
+            <tr>
+              <td>{{ r.class_name_pattern }}</td>
+              <td>{{ days[r.day_of_week] }} {{ r.time_of_day.strftime('%H:%M') }}</td>
+              <td>−{{ r.lead_time_hours }}h</td>
+              <td><small>{{ next_fires.get(r.id, '—') }}</small></td>
+              <td>
+                <form method="post" action="/automation/{{ r.id }}/toggle" style="display:inline">
+                  <button class="secondary outline small">
+                    {% if r.enabled %}Pause{% else %}Resume{% endif %}
+                  </button>
+                </form>
+              </td>
+              <td>
+                <form method="post" action="/automation/{{ r.id }}/delete" style="display:inline"
+                      onsubmit="return confirm('Delete this rule?')">
+                  <button class="contrast outline small">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </article>
+
+  <article>
+    <header><strong>Recent attempts</strong></header>
+    {% if not attempts %}
+      <p class="muted">No attempts yet.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>When</th><th>Class</th><th>Status</th><th>Note</th></tr></thead>
+        <tbody>
+          {% for a in attempts %}
+            <tr>
+              <td><small>{{ a.fired_at.strftime('%d %b %H:%M:%S') }}</small></td>
+              <td>{{ a.target_class }}</td>
+              <td>
+                {% if a.status == 'success' %}<span class="success">✓ {{ a.status }}</span>
+                {% elif a.status == 'retry' %}<span class="warn">↻ {{ a.status }}</span>
+                {% else %}<span class="error">✗ {{ a.status }}</span>{% endif %}
+              </td>
+              <td><small class="muted">{{ a.message }}</small></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </article>
+</section>
+{% endblock %}

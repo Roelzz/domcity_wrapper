@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Schedule · Domcity Planner{% endblock %}
+{% block content %}
+<section>
+  <header class="page-head">
+    <h2>Schedule</h2>
+    <div class="date-nav">
+      <a role="button" class="secondary" href="/schedule?date={{ prev_date }}">←</a>
+      <span class="week-label">Week of {{ start.strftime('%a %d %b %Y') }}</span>
+      <a role="button" class="secondary" href="/schedule?date={{ next_date }}">→</a>
+    </div>
+  </header>
+
+  {% if not classes %}
+    <p class="muted">No classes found for this week.</p>
+  {% else %}
+    <div class="class-grid">
+      {% for c in classes %}
+        <article class="class-card">
+          <header>
+            <strong>{{ c.name }}</strong>
+            <span class="muted">{{ c.start.strftime('%a %d %b · %H:%M') }}–{{ c.end.strftime('%H:%M') }}</span>
+          </header>
+          {% if c.instructor %}<p class="muted">👤 {{ c.instructor }}</p>{% endif %}
+          {% if c.spots_available is not none and c.spots_total %}
+            <p class="muted">{{ c.spots_available }} / {{ c.spots_total }} spots</p>
+          {% endif %}
+          <footer>
+            {% if c.booked %}
+              <span class="success">Booked ✓</span>
+            {% elif c.spots_available == 0 %}
+              <button class="secondary" disabled>Full</button>
+            {% else %}
+              <button hx-post="/schedule/book/{{ c.id }}"
+                      hx-swap="outerHTML"
+                      hx-disabled-elt="this">Book</button>
+            {% endif %}
+          </footer>
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

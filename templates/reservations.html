@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Reservations · Domcity Planner{% endblock %}
+{% block content %}
+<section>
+  <header class="page-head"><h2>My Reservations</h2></header>
+
+  {% if not reservations %}
+    <p class="muted">No upcoming reservations.</p>
+  {% else %}
+    <div class="reservation-list">
+      {% for r in reservations %}
+        <article id="res-{{ r.id }}" class="reservation-row">
+          <div>
+            <strong>{{ r.class_name }}</strong>
+            <p class="muted">{{ r.start.strftime('%a %d %b · %H:%M') }}–{{ r.end.strftime('%H:%M') }}</p>
+            {% if r.instructor %}<p class="muted">👤 {{ r.instructor }}</p>{% endif %}
+          </div>
+          <div>
+            {% if r.cancellable %}
+              <button class="secondary outline"
+                      hx-post="/reservations/{{ r.id }}/cancel"
+                      hx-target="#res-{{ r.id }}"
+                      hx-swap="outerHTML"
+                      hx-confirm="Cancel this reservation?">Cancel</button>
+            {% endif %}
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

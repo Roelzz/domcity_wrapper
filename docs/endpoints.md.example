@@ -1,0 +1,58 @@
+# PushPress endpoint reference
+
+Fill this in after capturing a HAR file from your gym's `members.pushpress.com` session.
+This file is gitignored (the real `endpoints.md`) so credentials/cookies don't leak.
+
+## How to capture
+
+1. Open Chrome → DevTools → Network tab → enable "Preserve log".
+2. Go to `https://members.pushpress.com` (or your gym's subdomain).
+3. Log in.
+4. Click around: schedule, my reservations, book a class, cancel one.
+5. In Network tab → right-click any row → "Save all as HAR with content" → save in `docs/session.har`.
+
+## What to fill in
+
+For each of the calls below, capture: method, full URL (path + query), request
+payload, request headers (especially CSRF + cookies), response shape (first
+~20 lines).
+
+### 1. Login
+- Method:
+- URL:
+- Payload:
+- Response:
+- Cookies set:
+
+### 2. Schedule (list classes)
+- Method:
+- URL:
+- Query params:
+- Response shape:
+
+### 3. My reservations
+- Method:
+- URL:
+- Response shape:
+
+### 4. Book a class
+- Method:
+- URL:
+- Payload:
+- Response:
+- CSRF header?:
+
+### 5. Cancel a reservation
+- Method:
+- URL (path param):
+- Response:
+
+## Updating the client
+
+Open `pushpress.py`, set:
+- `LOGIN_PATH`, `SCHEDULE_PATH`, `RESERVATIONS_PATH`, `BOOK_PATH`, `CANCEL_PATH`
+- Rewrite `_parse_schedule` and `_parse_reservations` to match real JSON keys
+- Adjust `_extract_csrf` if PushPress uses a different mechanism
+
+Run `uv run pytest` — the existing fixtures should still pass since they mock
+HTTP. Then point your `.env` at real credentials and try `uv run uvicorn main:app --port 2009`.
