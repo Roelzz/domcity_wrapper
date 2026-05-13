@@ -448,6 +448,22 @@ async def automation_delete(rule_id: int):
     return RedirectResponse("/automation", status_code=303)
 
 
+@app.post("/automation/{rule_id}/fire")
+async def automation_fire(rule_id: int):
+    """Manually trigger booking_window_job for this rule right now. Useful
+    for testing or to force an immediate attempt when the cron hasn't fired
+    yet."""
+    with DbSession(engine) as db:
+        rule = db.get(AutomationRule, rule_id)
+        if not rule:
+            raise HTTPException(404)
+        if not rule.enabled:
+            raise HTTPException(400, "rule is paused")
+    logger.info("Manually firing rule {} ('{}')", rule_id, rule.name)
+    await scheduler.booking_window_job(rule_id, 0)
+    return RedirectResponse("/automation", status_code=303)
+
+
 # ---------- Helpers ----------
 def _parse_date(s: str | None) -> date | None:
     if not s:
