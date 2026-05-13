@@ -7,7 +7,7 @@ from settings import settings
 
 COOKIE_NAME = "domcity_session"
 SESSION_VALUE = "ok"
-PUBLIC_PATHS = ("/login", "/static", "/healthz", "/favicon.ico")
+PUBLIC_PATHS = ("/login", "/static", "/healthz", "/favicon.ico", "/calendar.ics")
 
 _serializer = URLSafeSerializer(settings.secret_key, salt="domcity-auth")
 

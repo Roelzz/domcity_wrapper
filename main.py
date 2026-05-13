@@ -1,11 +1,11 @@
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from loguru import logger
@@ -201,6 +201,72 @@ async def reservations_page(request: Request):
         "token_warning": _token_warning(),
     }
     return templates.TemplateResponse(request, "reservations.html", ctx)
+
+
+@app.get("/calendar.ics")
+async def calendar_ics(token: str = ""):
+    """iCalendar feed of active reservations. Subscribe in Apple Calendar /
+    Google / Fastmail. Token-gated with the app password since calendar
+    clients can't carry the session cookie."""
+    if not token or token != settings.app_password:
+        raise HTTPException(status_code=403, detail="bad token")
+    if not (settings.pushpress_email and settings.pushpress_password):
+        return Response("", media_type="text/calendar")
+    try:
+        reservations = await pushpress.list_reservations()
+    except Exception:
+        logger.exception("calendar.ics: list_reservations failed")
+        reservations = []
+    body = _render_ical(reservations)
+    return Response(
+        body,
+        media_type="text/calendar; charset=utf-8",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
+def _render_ical(reservations) -> str:
+    """Hand-rolled VCALENDAR. One VEVENT per reservation."""
+    now_utc = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Domcity Planner//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Domcity Planner",
+        "X-WR-TIMEZONE:" + settings.tz,
+    ]
+    for r in reservations:
+        if not r.cancellable:
+            continue
+        start = r.start.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        end = r.end.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        summary = _ical_escape(r.class_name)
+        location = _ical_escape(r.location or "")
+        description_bits = []
+        if r.instructor:
+            description_bits.append(f"Coach: {r.instructor}")
+        description = _ical_escape("\\n".join(description_bits))
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{r.id}@domcity.local",
+            f"DTSTAMP:{now_utc}",
+            f"DTSTART:{start}",
+            f"DTEND:{end}",
+            f"SUMMARY:{summary}",
+        ]
+        if location:
+            lines.append(f"LOCATION:{location}")
+        if description:
+            lines.append(f"DESCRIPTION:{description}")
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _ical_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
 @app.post("/reservations/{reservation_id}/cancel", response_class=HTMLResponse)

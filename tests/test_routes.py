@@ -41,6 +41,21 @@ def test_authed_automation_loads():
         assert "Active rules" in r.text
 
 
+def test_calendar_ics_requires_token():
+    with TestClient(main.app) as client:
+        r = client.get("/calendar.ics")
+        assert r.status_code == 403
+
+
+def test_calendar_ics_with_token():
+    with TestClient(main.app) as client:
+        r = client.get("/calendar.ics?token=test-pw")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/calendar")
+        assert "BEGIN:VCALENDAR" in r.text
+        assert "END:VCALENDAR" in r.text
+
+
 def test_schedule_with_filters_in_url():
     with TestClient(main.app) as client:
         client.cookies.set(COOKIE_NAME, make_session_token())
