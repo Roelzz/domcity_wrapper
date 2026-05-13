@@ -3,12 +3,13 @@
     {% if selectors_complete %}
       <option value="" disabled selected>— no upcoming classes match —</option>
     {% else %}
-      <option value="" disabled selected>— pick location, training &amp; day —</option>
+      <option value="" disabled selected>— pick training &amp; day —</option>
     {% endif %}
   {% else %}
-    {% if not selected %}<option value="" disabled selected>— select time —</option>{% endif %}
-    {% for t in slots %}
-      <option value="{{ t }}" {% if t == selected %}selected{% endif %}>{{ t }}</option>
+    {% if not selected %}<option value="" disabled selected>— select time &amp; location —</option>{% endif %}
+    {% for loc, t in slots %}
+      {% set v = loc ~ "|" ~ t %}
+      <option value="{{ v }}" {% if v == selected %}selected{% endif %}>{{ t }} · {{ loc }}</option>
     {% endfor %}
   {% endif %}
 </select>

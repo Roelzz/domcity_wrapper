@@ -180,9 +180,11 @@ header nav .nav-links a.active {
 /* ---------- Automation form ---------- */
 .rule-form .row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: .75rem;
 }
+.rule-form .row .span-2 { grid-column: span 2; }
+@media (max-width: 640px) { .rule-form .row .span-2 { grid-column: span 1; } }
 
 /* ---------- Common ---------- */
 .muted { color: var(--pico-muted-color); margin: 0; }

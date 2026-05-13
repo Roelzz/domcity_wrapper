@@ -28,6 +28,7 @@ logger.add(
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DAYS_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+SLOT_SEPARATOR = "|"
 
 
 @asynccontextmanager
@@ -206,11 +207,7 @@ async def automation_page(
             select(BookingAttempt).order_by(BookingAttempt.fired_at.desc()).limit(20)
         ).all()
 
-    # Fetch ONE 14-day window of classes and reuse it for: dropdowns,
-    # initial time slots, and per-rule next-fire times. With caching this is
-    # ~1 round-trip on first call and free thereafter.
     classes = await _fetch_classes_for_automation()
-    locations = sorted({c.location for c in classes if c.location})
     categories = sorted({c.category for c in classes if c.category})
 
     next_fires: dict[int, str] = {}
@@ -221,14 +218,17 @@ async def automation_page(
         fire = _compute_next_fire_from(classes, r, now)
         next_fires[r.id] = fire.isoformat() if fire else "—"
 
-    initial_slots: list[str] = []
-    if prefill_location and prefill_category and prefill_day is not None:
+    initial_slots: list[tuple[str, str]] = []
+    selected_slot = ""
+    if prefill_category and prefill_day is not None:
         initial_slots = sorted({
-            c.start.strftime("%H:%M") for c in classes
-            if c.location.lower() == prefill_location.lower()
-            and c.category.lower() == prefill_category.lower()
+            (c.location, c.start.strftime("%H:%M")) for c in classes
+            if c.category.lower() == prefill_category.lower()
             and c.start.weekday() == int(prefill_day)
-        })
+            and c.location
+        }, key=lambda lt: (lt[1], lt[0]))
+    if prefill_location and prefill_time:
+        selected_slot = f"{prefill_location}{SLOT_SEPARATOR}{prefill_time}"
 
     ctx = {
         "active": "automation",
@@ -236,15 +236,13 @@ async def automation_page(
         "attempts": attempts,
         "next_fires": next_fires,
         "days": list(enumerate(DAYS_LONG)),
-        "locations": locations,
         "categories": categories,
         "initial_time_slots": initial_slots,
+        "initial_selected": selected_slot,
         "prefill": {
             "name": prefill_name or "",
-            "location": prefill_location or "",
             "category": prefill_category or "",
             "day": prefill_day if prefill_day is not None else "",
-            "time": prefill_time or "",
         },
         "token_warning": _token_warning(),
     }
@@ -289,21 +287,20 @@ def _compute_next_fire_from(classes, rule: AutomationRule, now):
 @app.get("/automation/time-slots", response_class=HTMLResponse)
 async def automation_time_slots(
     request: Request,
-    location: str = "",
     class_category: str = "",
     day_of_week: str = "",
     time_of_day: str = "",
 ):
-    """HTMX partial: returns a <select name=time_of_day> populated with the
-    available times for the given (location, category, day) combo."""
+    """HTMX partial: returns a <select name=time_of_day> populated with
+    (location, HH:MM) options for the given (training, day) combo."""
     try:
         dow = int(day_of_week) if day_of_week != "" else None
     except ValueError:
         dow = None
-    has_all_selectors = bool(location and class_category and dow is not None)
-    slots: list[str] = []
+    has_all_selectors = bool(class_category and dow is not None)
+    slots: list[tuple[str, str]] = []
     if has_all_selectors:
-        slots = await _time_slots_for(location, class_category, dow)
+        slots = await _time_slots_for(class_category, dow)
     return templates.TemplateResponse(
         request,
         "_time_slot_select.html",
@@ -344,15 +341,15 @@ async def automation_from_class(slot_id: str):
 @app.post("/automation")
 async def automation_create(
     name: str = Form(...),
-    location: str = Form(...),
     class_category: str = Form(...),
     day_of_week: int = Form(...),
-    time_of_day: str = Form(...),
+    time_of_day: str = Form(...),  # format: "Location|HH:MM"
 ):
     try:
-        hh, mm = (int(x) for x in time_of_day.split(":")[:2])
-    except ValueError as e:
-        raise HTTPException(400, f"Bad time: {e}") from e
+        location, hhmm = time_of_day.split(SLOT_SEPARATOR, 1)
+        hh, mm = (int(x) for x in hhmm.split(":")[:2])
+    except (ValueError, AttributeError) as e:
+        raise HTTPException(400, f"Bad time slot: {e}") from e
     rule = AutomationRule(
         name=name.strip() or f"{DAYS_LONG[day_of_week]} {class_category}",
         location=location.strip(),
@@ -452,8 +449,9 @@ async def _booked_class_ids() -> set[str]:
         return set()
 
 
-async def _time_slots_for(location: str, category: str, day_of_week: int) -> list[str]:
-    """Return unique HH:MM strings for upcoming classes matching the combo."""
+async def _time_slots_for(category: str, day_of_week: int) -> list[tuple[str, str]]:
+    """Return unique (location, HH:MM) tuples for upcoming classes matching
+    the (category, day) combo. Sorted by time then location for easy scanning."""
     if not settings.pushpress_token:
         return []
     today = datetime.now().date()
@@ -462,16 +460,16 @@ async def _time_slots_for(location: str, category: str, day_of_week: int) -> lis
     except Exception:
         logger.exception("time slots fetch failed")
         return []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for c in items:
-        if c.location.lower() != location.lower():
-            continue
         if c.category.lower() != category.lower():
             continue
         if c.start.weekday() != day_of_week:
             continue
-        seen.add(c.start.strftime("%H:%M"))
-    return sorted(seen)
+        if not c.location:
+            continue
+        seen.add((c.location, c.start.strftime("%H:%M")))
+    return sorted(seen, key=lambda lt: (lt[1], lt[0]))
 
 
 def _token_warning() -> str | None:

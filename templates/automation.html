@@ -13,23 +13,9 @@
     <form method="post" action="/automation" class="rule-form" id="automation-form">
       <label>
         Name
-        <input name="name" required value="{{ prefill.name }}" placeholder="e.g. Wednesday Classic CrossFit OV" />
+        <input name="name" required value="{{ prefill.name }}" placeholder="e.g. Wednesday Classic CrossFit" />
       </label>
       <div class="row">
-        <label>
-          Location
-          <select name="location" required
-                  hx-get="/automation/time-slots"
-                  hx-trigger="change"
-                  hx-target="#time-slot-select"
-                  hx-swap="outerHTML"
-                  hx-include="closest form">
-            <option value="" disabled {% if not prefill.location %}selected{% endif %}>—</option>
-            {% for loc in locations %}
-              <option value="{{ loc }}" {% if loc == prefill.location %}selected{% endif %}>{{ loc }}</option>
-            {% endfor %}
-          </select>
-        </label>
         <label>
           Training
           <select name="class_category" required
@@ -58,12 +44,12 @@
             {% endfor %}
           </select>
         </label>
-        <label>
-          Time slot
+        <label class="span-2">
+          Time &amp; location
           {% set slots = initial_time_slots %}
-          {% set selected = prefill.time %}
+          {% set selected = initial_selected %}
           {% set ready = initial_time_slots | length > 0 %}
-          {% set selectors_complete = (prefill.location and prefill.category and prefill.day != "") %}
+          {% set selectors_complete = (prefill.category and prefill.day != "") %}
           {% include "_time_slot_select.html" %}
         </label>
       </div>
