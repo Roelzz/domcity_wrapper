@@ -49,6 +49,8 @@ def fake_token(request, monkeypatch):
     pushpress._last_login_success_at = None
     pushpress._last_login_attempt_at = None
     pushpress._tenant = None
+    pushpress._reservations_cache = None
+    pushpress._schedule_cache.clear()
 
 
 def test_decode_jwt_extracts_claims():
@@ -147,8 +149,10 @@ async def test_list_reservations_filters_cancelled():
 @respx.mock
 @pytest.mark.asyncio
 async def test_book_uses_tenant_uuids():
-    # First call -> profile lookup (lazy tenant load)
-    # Then mutation. respx side_effect handles ordering.
+    # GraphQL call order with the already-booked guard in place:
+    # 1. profile lookup (lazy tenant load)
+    # 2. list_reservations (pre-book check, returns empty list)
+    # 3. createReservation mutation
     profile_resp = httpx.Response(
         200,
         json={
@@ -174,6 +178,9 @@ async def test_book_uses_tenant_uuids():
             }
         },
     )
+    empty_reservations_resp = httpx.Response(
+        200, json={"data": {"reservations": [], "__typename": "Query"}}
+    )
     book_resp = httpx.Response(
         200,
         json={
@@ -183,7 +190,9 @@ async def test_book_uses_tenant_uuids():
             }
         },
     )
-    respx.post(pushpress.GRAPHQL_URL).mock(side_effect=[profile_resp, book_resp])
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        side_effect=[profile_resp, empty_reservations_resp, book_resp]
+    )
     result = await pushpress.book("cal-xyz")
     assert result.ok
     assert result.reservation_id == "reg-new"
@@ -216,10 +225,15 @@ async def test_book_returns_error_on_graphql_error():
             }
         },
     )
+    empty_reservations_resp = httpx.Response(
+        200, json={"data": {"reservations": [], "__typename": "Query"}}
+    )
     err_resp = httpx.Response(
         200, json={"errors": [{"message": "Class full"}], "data": None}
     )
-    respx.post(pushpress.GRAPHQL_URL).mock(side_effect=[profile_resp, err_resp])
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        side_effect=[profile_resp, empty_reservations_resp, err_resp]
+    )
     result = await pushpress.book("cal-xyz")
     assert not result.ok
     assert "Class full" in result.message
@@ -351,3 +365,66 @@ async def test_gql_does_not_refresh_on_401_when_token_is_valid(monkeypatch):
         with pytest.raises(pushpress._GqlError):
             await pushpress._gql("query{x}", {})
     assert login_calls == 0, "must not trigger login when cached token is still valid"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_book_returns_already_reserved_without_calling_mutation():
+    """PushPress's createReservation is idempotent and returns ok for slots
+    the user already booked. Guard short-circuits before the mutation so
+    callers see a stable 'already reserved' terminal error instead."""
+    profile_resp = httpx.Response(
+        200,
+        json={
+            "data": {
+                "profile": {
+                    "clientUserUuid": "cuu",
+                    "userUuid": "u",
+                    "clientUuid": "c",
+                    "firstName": "T",
+                    "lastName": "U",
+                    "subscriptions": [
+                        {
+                            "subscriptionUuid": "sub",
+                            "status": "active",
+                            "active": True,
+                            "plan": "p",
+                            "__typename": "Subscription",
+                        }
+                    ],
+                    "__typename": "Profile",
+                }
+            }
+        },
+    )
+    reservations_with_target = httpx.Response(
+        200,
+        json={
+            "data": {
+                "reservations": [
+                    {
+                        "uuid": "reg-existing",
+                        "reservationTitle": "Classic CrossFit",
+                        "calendarItemUuid": "cal-xyz",
+                        "isActive": True,
+                        "isCancelled": False,
+                        "rawStartTime": "2026-05-27T16:30:00+00:00",
+                        "rawEndTime": "2026-05-27T17:30:00+00:00",
+                        "rawStatus": "registered",
+                        "calendarItem": {"mainCoach": None, "__typename": "Class"},
+                        "__typename": "Reservation",
+                    }
+                ],
+                "__typename": "Query",
+            }
+        },
+    )
+    boom = httpx.Response(500, text="mutation must NOT be called")
+    route = respx.post(pushpress.GRAPHQL_URL).mock(
+        side_effect=[profile_resp, reservations_with_target, boom]
+    )
+    result = await pushpress.book("cal-xyz")
+    assert not result.ok
+    assert result.message == "already reserved"
+    # Exactly two GraphQL calls: profile + reservations. The mutation was skipped.
+    assert route.call_count == 2

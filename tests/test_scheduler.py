@@ -124,3 +124,207 @@ def test_match_slot_filters_by_location_and_category():
     rule = make_rule(dow=3, hh=9)
     match = scheduler._match_slot(slots, rule, target)
     assert match.id == "a"
+
+
+# ---- Loop-guard + advance-past-slot regressions ----------------------------
+
+
+@pytest.fixture
+def reset_loop_guard():
+    scheduler._last_fire_at.clear()
+    yield
+    scheduler._last_fire_at.clear()
+
+
+def _ov_slot(uuid: str, start: datetime, spots: int = 5) -> ClassSlot:
+    return ClassSlot(
+        id=uuid,
+        name="OV | Classic CrossFit",
+        location="Overste den Oudenlaan 9",
+        location_code="OV",
+        category="Classic CrossFit",
+        start=start,
+        end=start + timedelta(hours=1),
+        spots_available=spots,
+        spots_total=14,
+        registration_start_offset_min=-20160,
+    )
+
+
+@pytest.mark.asyncio
+async def test_loop_guard_short_circuits_rapid_refire(monkeypatch, reset_loop_guard):
+    """Two booking_window_job calls for the same rule within LOOP_GUARD_WINDOW_SEC:
+    the second must abort without touching PushPress or rescheduling."""
+    rule = make_rule(dow=2, hh=18, mm=30)
+    slot = _ov_slot("cal-loopguard", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+
+    # Stub the DB lookup of the rule.
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _FakeDb(rule))
+    # Stub the slot lookup.
+    async def fake_lookup(uuid):
+        assert uuid == "cal-loopguard"
+        return slot
+    monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
+    # Stub pushpress.book — must NOT be called on the second invocation.
+    book_calls: list[str] = []
+    async def fake_book(uuid):
+        from pushpress import BookingResult
+        book_calls.append(uuid)
+        return BookingResult(ok=True, reservation_id="reg-1", message="booked")
+    monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
+    # Silence notify + reminder scan + downstream scheduling.
+    async def noop(*_a, **_k):
+        return None
+    monkeypatch.setattr(scheduler.notify, "send", noop)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "reminder_scan_job", noop)
+    monkeypatch.setattr(scheduler, "_schedule_after", noop)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler.booking_window_job(rule.id, 0, "cal-loopguard")
+    await scheduler.booking_window_job(rule.id, 0, "cal-loopguard")
+
+    assert book_calls == ["cal-loopguard"], (
+        "second rapid fire should have been blocked by the loop guard"
+    )
+
+
+@pytest.mark.asyncio
+async def test_booking_window_job_books_passed_uuid_not_lookup_result(
+    monkeypatch, reset_loop_guard
+):
+    """Regression: the buggy version re-queried `find_next_matching_slot(now)` and
+    could end up booking a different slot than the one queued. Now the job
+    must book exactly the slot whose uuid it received."""
+    rule = make_rule(dow=2, hh=18, mm=30)
+    queued_uuid = "cal-queued"
+    queued_slot = _ov_slot(queued_uuid, datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _FakeDb(rule))
+    async def fake_lookup(uuid):
+        return queued_slot if uuid == queued_uuid else None
+    monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
+    book_calls: list[str] = []
+    async def fake_book(uuid):
+        from pushpress import BookingResult
+        book_calls.append(uuid)
+        return BookingResult(ok=True, reservation_id="r", message="booked")
+    monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
+    async def noop(*_a, **_k):
+        return None
+    monkeypatch.setattr(scheduler.notify, "send", noop)
+    monkeypatch.setattr(scheduler, "reminder_scan_job", noop)
+    monkeypatch.setattr(scheduler, "_schedule_after", noop)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler.booking_window_job(rule.id, 0, queued_uuid)
+
+    assert book_calls == [queued_uuid]
+
+
+@pytest.mark.asyncio
+async def test_handle_failure_user_terminal_advances_past_slot(
+    monkeypatch, reset_loop_guard
+):
+    """Replaces the buggy `_schedule_after(now + 1h)` that caused the May 20
+    incident. The user-terminal branch must reschedule with after=slot.start+1min
+    so find_next_matching_slot returns the FOLLOWING week's slot."""
+    rule = make_rule(dow=2, hh=18, mm=30)
+    slot = _ov_slot("cal-failed", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+
+    captured: dict[str, datetime] = {}
+    async def fake_schedule_after(_rule, after):
+        captured["after"] = after
+    monkeypatch.setattr(scheduler, "_schedule_after", fake_schedule_after)
+    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler._handle_failure(
+        rule, attempt=0, label="x", msg="already reserved", slot=slot
+    )
+
+    expected = slot.start.astimezone(TZ) + timedelta(minutes=1)
+    assert captured["after"] == expected, (
+        f"user-terminal failure must advance past slot.start "
+        f"(got {captured['after']}, expected {expected})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_failure_max_retries_advances_past_slot(
+    monkeypatch, reset_loop_guard
+):
+    rule = make_rule(dow=2, hh=18, mm=30)
+    slot = _ov_slot("cal-failed", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+
+    captured: dict[str, datetime] = {}
+    async def fake_schedule_after(_rule, after):
+        captured["after"] = after
+    monkeypatch.setattr(scheduler, "_schedule_after", fake_schedule_after)
+    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    # transient message (not class-full, not user-terminal), at the final attempt
+    await scheduler._handle_failure(
+        rule,
+        attempt=scheduler.MAX_RETRIES - 1,
+        label="x",
+        msg="connection reset",
+        slot=slot,
+    )
+
+    expected = slot.start.astimezone(TZ) + timedelta(minutes=1)
+    assert captured["after"] == expected
+
+
+@pytest.mark.asyncio
+async def test_handle_failure_terminal_uses_digest_not_immediate_telegram(
+    monkeypatch, reset_loop_guard
+):
+    """The May 20 incident sent a Telegram on every loop iteration. Terminal
+    failures must now route to the daily digest instead."""
+    rule = make_rule(dow=2, hh=18, mm=30)
+    slot = _ov_slot("cal-failed", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+
+    send_calls = []
+    digest_calls = []
+    async def fake_send(msg):
+        send_calls.append(msg)
+    def fake_queue(msg):
+        digest_calls.append(msg)
+    monkeypatch.setattr(scheduler.notify, "send", fake_send)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", fake_queue)
+    monkeypatch.setattr(scheduler, "_schedule_after", _async_noop)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler._handle_failure(
+        rule, attempt=0, label="x", msg="already reserved", slot=slot
+    )
+
+    assert send_calls == [], "no immediate Telegram for terminal failure"
+    assert any("terminal" in line.lower() for line in digest_calls)
+
+
+# ---- Test helpers ----------------------------------------------------------
+
+
+async def _async_noop(*_a, **_k):
+    return None
+
+
+class _FakeDb:
+    """Minimal context-manager stand-in for sqlmodel.Session used by
+    booking_window_job's `db.get(AutomationRule, rule_id)` call."""
+    def __init__(self, rule):
+        self._rule = rule
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def get(self, _model, _rule_id):
+        return self._rule

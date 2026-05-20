@@ -393,6 +393,17 @@ async def book(calendar_item_uuid: str) -> BookingResult:
     tenant = await get_tenant()
     if not tenant.subscription_uuid:
         return BookingResult(ok=False, message="No active subscription found on this account")
+    # PushPress's createReservation mutation is idempotent — calling it for a
+    # slot the user already has a reservation for returns the existing uuid
+    # and looks like a fresh success. Check reservations first so callers see
+    # a stable "already reserved" terminal error instead of a phantom ✅.
+    try:
+        existing = await list_reservations()
+    except Exception as e:
+        logger.warning("book: pre-check list_reservations failed, proceeding: {}", e)
+    else:
+        if any(r.class_id == calendar_item_uuid for r in existing):
+            return BookingResult(ok=False, message="already reserved")
     variables = {
         "clientUserUuid": tenant.client_user_uuid,
         "calendarItemUuid": calendar_item_uuid,
