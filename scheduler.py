@@ -69,6 +69,13 @@ def _is_user_terminal(msg: str) -> bool:
 
 _scheduler: AsyncIOScheduler | None = None
 
+# Defensive loop guard: tracks the last time booking_window_job actually ran
+# the booking logic for each rule. If the same rule fires again within
+# LOOP_GUARD_WINDOW_SEC, we abort that fire instead of re-attempting — this
+# stops a runaway scheduling loop from spamming Telegram or PushPress.
+_last_fire_at: dict[int, datetime] = {}
+LOOP_GUARD_WINDOW_SEC = 30
+
 
 def tz() -> ZoneInfo:
     return ZoneInfo(settings.tz)
@@ -343,7 +350,7 @@ async def schedule_rule(rule: AutomationRule) -> None:
         booking_window_job,
         "date",
         run_date=fire_at,
-        args=[rule.id, 0],
+        args=[rule.id, 0, slot.id],
         id=job_id,
         replace_existing=True,
         misfire_grace_time=60,
@@ -363,24 +370,63 @@ async def next_window_open_async(rule: AutomationRule) -> datetime | None:
     return max(fire, datetime.now(tz()))
 
 
-async def booking_window_job(rule_id: int, attempt: int) -> None:
-    """One-shot job: try to book the next matching class. Branches:
+async def booking_window_job(
+    rule_id: int, attempt: int, calendar_item_uuid: str
+) -> None:
+    """One-shot job: try to book the specific class this rule was queued for.
+    Branches:
       - success → log + notify + schedule next week's class
       - class full → switch to 12h poll mode (no spamming)
       - user-terminal error (cap exceeded etc) → log + give up + next week
-      - transient → retry every 30s up to MAX_RETRIES"""
+      - transient → retry every 30s up to MAX_RETRIES
+
+    `calendar_item_uuid` is the slot _schedule_after / schedule_rule queued
+    this job for — it's the source of truth. We do NOT re-resolve "the next
+    matching slot" here, because that lookup is time-sensitive (a slot from
+    this week can re-appear if the job fires before its class starts) and
+    used to cause infinite loops re-booking the same idempotent reservation.
+    """
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
         if not rule or not rule.enabled:
             logger.info("Rule {} missing or disabled, skipping", rule_id)
             return
 
-    slot, hint = await find_next_matching_slot(rule)
-    target_label = f"{rule.name} — {hint.strftime('%a %d %b %H:%M')}"
-    logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
+    now = datetime.now(tz())
+    last = _last_fire_at.get(rule_id)
+    if last is not None and (now - last).total_seconds() < LOOP_GUARD_WINDOW_SEC:
+        elapsed = (now - last).total_seconds()
+        logger.error(
+            "Rule {} firing too fast (last {:.1f}s ago), aborting to break loop",
+            rule_id, elapsed,
+        )
+        notify.queue_for_digest(
+            f"⚠️ rule {rule_id} ('{rule.name}') loop-guarded ({elapsed:.0f}s)"
+        )
+        return
+    _last_fire_at[rule_id] = now
 
-    if not slot:
-        return await _handle_failure(rule, attempt, target_label, "no matching class found", slot=None)
+    slot = await _lookup_slot(calendar_item_uuid)
+    if slot is None:
+        # Slot vanished between scheduling and firing (gym cancelled / past).
+        # Advance to the next matching class instead of retrying this one.
+        label = f"{rule.name} (cal {calendar_item_uuid[:20]}…)"
+        logger.warning(
+            "Firing rule {} attempt {}: target slot {} no longer on schedule",
+            rule_id, attempt + 1, calendar_item_uuid,
+        )
+        _record(rule.id, label, "failure", "target class disappeared before booking")
+        notify.queue_for_digest(
+            f"⚠️ {rule.name}: target class disappeared before booking window opened"
+        )
+        await _schedule_after(
+            rule, next_class_datetime(rule, now) + timedelta(days=1)
+        )
+        return
+
+    class_start = slot.start.astimezone(tz())
+    target_label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
+    logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
 
     # If the class is already full at window-open, skip the booking attempt
     # entirely and start polling for an opening.
@@ -400,9 +446,21 @@ async def booking_window_job(rule_id: int, attempt: int) -> None:
         # immediately instead of waiting up to 15 min for the next interval.
         await reminder_scan_job()
         # Re-schedule for the FOLLOWING week (look past the slot we just booked).
-        await _schedule_after(rule, slot.start.astimezone(tz()) + timedelta(minutes=1))
+        await _schedule_after(rule, class_start + timedelta(minutes=1))
     else:
         await _handle_failure(rule, attempt, target_label, result.message, slot=slot)
+
+
+async def _lookup_slot(calendar_item_uuid: str):
+    """Fetch the specific slot we're about to book by uuid. Returns the
+    ClassSlot or None if it's not in the upcoming schedule."""
+    today = datetime.now(tz()).date()
+    try:
+        slots = await pushpress.list_schedule(today, today + timedelta(days=LOOKAHEAD_DAYS))
+    except Exception as e:
+        logger.warning("_lookup_slot fetch failed for {}: {}", calendar_item_uuid, e)
+        return None
+    return next((s for s in slots if s.id == calendar_item_uuid), None)
 
 
 async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
@@ -428,10 +486,12 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
     if slot is None:
         # Class has vanished — gym cancelled it, or it scrolled past the
         # lookahead window. Either way, move on to next week's class.
+        # `after=now` is safe because the vanished slot is no longer in the
+        # schedule and therefore cannot be re-selected by find_next_matching_slot.
         label = f"{rule.name} (cal {calendar_item_uuid[:20]}…)"
         _record(rule.id, label, "failure", "class no longer on schedule")
         await notify.send(f"❌ {rule.name}: target class disappeared from the schedule")
-        await _schedule_after(rule, datetime.now(tz()) + timedelta(hours=1))
+        await _schedule_after(rule, datetime.now(tz()))
         return
 
     class_start = slot.start.astimezone(tz())
@@ -469,7 +529,9 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
     # Someone took it first / different error
     if _is_user_terminal(result.message):
         _record(rule.id, label, "failure", f"terminal during poll: {result.message}")
-        await notify.send(f"❌ Poll booking failed (terminal): {label}\n{result.message}")
+        notify.queue_for_digest(
+            f"❌ Poll booking failed (terminal): {label}\n{result.message}"
+        )
         await _schedule_after(rule, class_start + timedelta(minutes=1))
         return
     # Race lost, or some other recoverable error — keep polling
@@ -568,7 +630,7 @@ async def _schedule_after(rule: AutomationRule, after: datetime) -> None:
         booking_window_job,
         "date",
         run_date=fire_at,
-        args=[rule.id, 0],
+        args=[rule.id, 0, slot.id],
         id=job_id,
         replace_existing=True,
         misfire_grace_time=60,
@@ -577,6 +639,19 @@ async def _schedule_after(rule: AutomationRule, after: datetime) -> None:
         "Re-scheduled rule {} ('{}') for {} (next class {} at {})",
         rule.id, rule.name, fire_at.isoformat(), slot.id, slot.start.isoformat(),
     )
+
+
+async def _advance_past_slot(rule: AutomationRule, slot) -> None:
+    """Reschedule the rule for the class AFTER `slot`. Used when the current
+    slot is unrecoverable (terminal failure, retries exhausted). Using
+    slot.start + 1min as the cutoff guarantees find_next_matching_slot
+    returns a DIFFERENT slot, breaking any retry loop. Falls back to a
+    7-day skip if slot is None (no anchor to advance past)."""
+    if slot is not None:
+        after = slot.start.astimezone(tz()) + timedelta(minutes=1)
+    else:
+        after = next_class_datetime(rule, datetime.now(tz())) + timedelta(days=1)
+    await _schedule_after(rule, after)
 
 
 async def _handle_failure(
@@ -589,26 +664,36 @@ async def _handle_failure(
         await _start_polling(rule, slot, label, msg)
         return
 
-    # User-side terminal → give up + next week
+    # User-side terminal → give up on THIS slot, advance to the next match.
+    # Quiet path: route to digest, not immediate Telegram — the rule already
+    # gave up, nothing for the user to do right now.
     if _is_user_terminal(msg):
         _record(rule.id, label, "failure", f"terminal: {msg}")
-        await notify.send(f"❌ Failed (terminal): {label}\n{msg}")
-        await _schedule_after(rule, datetime.now(tz()) + timedelta(hours=1))
+        notify.queue_for_digest(f"❌ Failed (terminal): {label}\n{msg}")
+        await _advance_past_slot(rule, slot)
         return
 
     # Transient → retry every 30s up to MAX_RETRIES
     if attempt + 1 >= MAX_RETRIES:
         _record(rule.id, label, "failure", msg)
-        await notify.send(f"❌ Failed (gave up after {MAX_RETRIES} retries): {label}\n{msg}")
-        await _schedule_after(rule, datetime.now(tz()) + timedelta(hours=1))
+        notify.queue_for_digest(
+            f"❌ Failed (gave up after {MAX_RETRIES} retries): {label}\n{msg}"
+        )
+        await _advance_past_slot(rule, slot)
         return
     _record(rule.id, label, "retry", msg)
     run_at = datetime.now(tz()) + timedelta(seconds=RETRY_DELAY_SEC)
+    # Retry the SAME slot — pass slot.id forward. If slot is somehow None at
+    # this point (find_next_matching_slot returned nothing), there's no slot
+    # to retry, so we'd have already taken the user-terminal/no-class branch
+    # via _handle_failure(slot=None) on the next call.
+    if slot is None:
+        return
     get_scheduler().add_job(
         booking_window_job,
         "date",
         run_date=run_at,
-        args=[rule.id, attempt + 1],
+        args=[rule.id, attempt + 1, slot.id],
         id=f"rule-{rule.id}-retry-{attempt + 1}",
         replace_existing=True,
     )
