@@ -69,14 +69,26 @@
     {% else %}
       <table>
         <thead>
-          <tr><th>Name</th><th>Class</th><th>When</th><th>Next fire</th><th>Paused until</th><th></th><th></th><th></th></tr>
+          <tr><th>Name</th><th>Class</th><th>When</th><th>Horizon (14d)</th><th>Next fire</th><th>Paused until</th><th></th><th></th><th></th></tr>
         </thead>
         <tbody>
           {% for r in rules %}
+            {% set h = horizons.get(r.id, {'total': 0, 'booked': 0, 'queued': 0}) %}
             <tr>
               <td><strong>{{ r.name }}</strong></td>
               <td><small>{{ r.class_category }}<br><span class="muted">{{ r.location }}</span></small></td>
               <td>{{ day_short[r.day_of_week] }} {{ r.time_of_day.strftime('%H:%M') }}</td>
+              <td>
+                <small>
+                  {% if h.total == 0 %}
+                    <span class="muted">no upcoming class</span>
+                  {% else %}
+                    {% if h.booked %}<span class="success">✓ {{ h.booked }}</span>{% endif %}
+                    {% if h.queued %}<span class="muted">⏳ {{ h.queued }}</span>{% endif %}
+                    <span class="muted small">of {{ h.total }}</span>
+                  {% endif %}
+                </small>
+              </td>
               <td><small>{{ next_fires.get(r.id, '—') }}</small></td>
               <td>
                 <form method="post" action="/automation/{{ r.id }}/pause-until" class="pause-until-form" style="display:flex;gap:.25rem;align-items:center;margin:0;">
@@ -107,7 +119,7 @@
               </td>
             </tr>
             <tr class="backup-row">
-              <td colspan="8" style="border-top:0;padding-top:.25rem;">
+              <td colspan="9" style="border-top:0;padding-top:.25rem;">
                 {% set chain = backup_chains.get(r.id, []) %}
                 {% if chain %}
                   <div class="backup-chain" style="display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;font-size:.8rem;">

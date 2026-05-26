@@ -35,10 +35,11 @@ async def lifespan(app: FastAPI):
     init_db()
     scheduler.start()
     await _prime_token()
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     scheduler.schedule_token_refresh()
     scheduler.schedule_reminder_scan()
     scheduler.schedule_daily_digest()
+    scheduler.schedule_horizon_refresh()
     logger.info("Domcity Planner up on port {}", settings.port)
     yield
     scheduler.shutdown()
@@ -414,13 +415,30 @@ async def automation_page(
     classes = await _fetch_classes_for_automation()
     categories = sorted({c.category for c in classes if c.category})
 
+    # Reservations let us mark which queued slots are already booked.
+    try:
+        reservations = await pushpress.list_reservations()
+        booked_class_ids = {res.class_id for res in reservations}
+    except Exception:
+        booked_class_ids = set()
+
     next_fires: dict[int, str] = {}
+    horizons: dict[int, dict] = {}
     now = datetime.now(scheduler.tz())
     for r in rules:
         if not r.enabled:
             continue
         fire = _compute_next_fire_from(classes, r, now)
         next_fires[r.id] = fire.isoformat() if fire else "—"
+        # Horizon: count booked vs queued matching slots in the 14d lookahead.
+        matches = scheduler.find_all_matching_slots(r, classes, now)
+        booked = sum(1 for s in matches if s.id in booked_class_ids)
+        queued = len(matches) - booked
+        horizons[r.id] = {
+            "total": len(matches),
+            "booked": booked,
+            "queued": queued,
+        }
 
     # In backup mode, default the cascading form's day/time from the primary
     # rule (the typical case: same-day-same-time backup at a different location
@@ -449,6 +467,7 @@ async def automation_page(
         "backup_chains": backup_chains,
         "attempts": attempts,
         "next_fires": next_fires,
+        "horizons": horizons,
         "days": list(enumerate(DAYS_LONG)),
         "categories": categories,
         "day_time": day_time_ctx,
@@ -625,7 +644,7 @@ async def automation_create(
         db.add(rule)
         db.commit()
         db.refresh(rule)
-    await scheduler.schedule_rule(rule)
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -638,7 +657,7 @@ async def automation_toggle(rule_id: int):
         rule.enabled = not rule.enabled
         db.add(rule)
         db.commit()
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -657,7 +676,7 @@ async def automation_delete(rule_id: int):
                 db.add(r)
             db.delete(rule)
             db.commit()
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -677,7 +696,7 @@ async def automation_pause_until(rule_id: int, paused_until: str = Form("")):
         rule.paused_until = parsed
         db.add(rule)
         db.commit()
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -758,7 +777,7 @@ async def automation_add_backup(
         _attach_backup_to_chain_tail(db, rule_id, new_rule)
         db.commit()
 
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -798,7 +817,7 @@ async def automation_from_class_as_backup(
         _attach_backup_to_chain_tail(db, primary_rule_id, new_rule)
         db.commit()
 
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 
@@ -822,7 +841,7 @@ async def automation_remove_backup(rule_id: int):
             # rules that someone wired up as a backup should be left alone.
             db.delete(backup)
         db.commit()
-    await scheduler.reschedule_all()
+    await scheduler.horizon_refresh_all()
     return RedirectResponse("/automation", status_code=303)
 
 

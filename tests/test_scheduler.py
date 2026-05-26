@@ -62,24 +62,6 @@ def test_window_open_with_zero_offset_is_class_start():
     assert scheduler.window_open_time(slot) == start
 
 
-@pytest.mark.parametrize(
-    "hours_until_class, expected_interval_min",
-    [
-        (100, 12 * 60),  # >48h -> 12h
-        (49, 12 * 60),   # boundary just above
-        (47, 4 * 60),    # 24h–48h -> 4h
-        (25, 4 * 60),    # boundary just above 24h
-        (23, 60),        # 6h–24h -> 1h
-        (7, 60),         # boundary
-        (5, 15),         # 1h–6h -> 15m
-        (1.5, 15),       # boundary
-    ],
-)
-def test_poll_interval_brackets(hours_until_class, expected_interval_min):
-    interval = scheduler._poll_interval_for(timedelta(hours=hours_until_class))
-    assert interval.total_seconds() / 60 == expected_interval_min
-
-
 def test_paused_until_skips_targeted_class():
     """find_next_matching_slot must skip slots on or before paused_until."""
     from datetime import date as _date
@@ -178,7 +160,6 @@ async def test_loop_guard_short_circuits_rapid_refire(monkeypatch, reset_loop_gu
     monkeypatch.setattr(scheduler.notify, "send", noop)
     monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
     monkeypatch.setattr(scheduler, "reminder_scan_job", noop)
-    monkeypatch.setattr(scheduler, "_schedule_after", noop)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
     await scheduler.booking_window_job(rule.id, 0, "cal-loopguard")
@@ -214,7 +195,6 @@ async def test_booking_window_job_books_passed_uuid_not_lookup_result(
         return None
     monkeypatch.setattr(scheduler.notify, "send", noop)
     monkeypatch.setattr(scheduler, "reminder_scan_job", noop)
-    monkeypatch.setattr(scheduler, "_schedule_after", noop)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
     await scheduler.booking_window_job(rule.id, 0, queued_uuid)
@@ -223,60 +203,34 @@ async def test_booking_window_job_books_passed_uuid_not_lookup_result(
 
 
 @pytest.mark.asyncio
-async def test_handle_failure_user_terminal_advances_past_slot(
+async def test_handle_failure_already_reserved_does_not_chain(
     monkeypatch, reset_loop_guard
 ):
-    """Replaces the buggy `_schedule_after(now + 1h)` that caused the May 20
-    incident. The user-terminal branch must reschedule with after=slot.start+1min
-    so find_next_matching_slot returns the FOLLOWING week's slot."""
-    rule = make_rule(dow=2, hh=18, mm=30)
-    slot = _ov_slot("cal-failed", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+    """Idempotency: if PushPress says 'already reserved', we have the booking.
+    Don't chain to backup (would book a backup we don't need) and don't notify
+    the user (the booking is already there)."""
+    primary = _backup_rule(1, backup_rule_id=2)
+    backup = _backup_rule(2, backup_only=True)
+    slot = _ov_slot("cal-already", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
 
-    captured: dict[str, datetime] = {}
-    async def fake_schedule_after(_rule, after):
-        captured["after"] = after
-    monkeypatch.setattr(scheduler, "_schedule_after", fake_schedule_after)
+    monkeypatch.setattr(scheduler, "DbSession",
+                        lambda *_a, **_k: _MultiFakeDb({1: primary, 2: backup}))
+    chain_calls = []
+    async def fake_chain(*a, **k):
+        chain_calls.append(True)
+        return True
+    monkeypatch.setattr(scheduler, "_chain_to_backup", fake_chain)
     monkeypatch.setattr(scheduler.notify, "send", _async_noop)
     monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
     await scheduler._handle_failure(
-        rule, attempt=0, label="x", msg="already reserved", slot=slot
+        primary, attempt=0, label="x", msg="already reserved", slot=slot
     )
 
-    expected = slot.start.astimezone(TZ) + timedelta(minutes=1)
-    assert captured["after"] == expected, (
-        f"user-terminal failure must advance past slot.start "
-        f"(got {captured['after']}, expected {expected})"
+    assert chain_calls == [], (
+        "'already reserved' is idempotent — must not trigger backup chain"
     )
-
-
-@pytest.mark.asyncio
-async def test_handle_failure_max_retries_advances_past_slot(
-    monkeypatch, reset_loop_guard
-):
-    rule = make_rule(dow=2, hh=18, mm=30)
-    slot = _ov_slot("cal-failed", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
-
-    captured: dict[str, datetime] = {}
-    async def fake_schedule_after(_rule, after):
-        captured["after"] = after
-    monkeypatch.setattr(scheduler, "_schedule_after", fake_schedule_after)
-    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
-    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
-    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
-
-    # transient message (not class-full, not user-terminal), at the final attempt
-    await scheduler._handle_failure(
-        rule,
-        attempt=scheduler.MAX_RETRIES - 1,
-        label="x",
-        msg="connection reset",
-        slot=slot,
-    )
-
-    expected = slot.start.astimezone(TZ) + timedelta(minutes=1)
-    assert captured["after"] == expected
 
 
 @pytest.mark.asyncio
@@ -284,7 +238,7 @@ async def test_handle_failure_terminal_uses_digest_not_immediate_telegram(
     monkeypatch, reset_loop_guard
 ):
     """The May 20 incident sent a Telegram on every loop iteration. Terminal
-    failures must now route to the daily digest instead."""
+    failures must route to the daily digest instead."""
     rule = make_rule(dow=2, hh=18, mm=30)
     slot = _ov_slot("cal-failed", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
 
@@ -296,11 +250,12 @@ async def test_handle_failure_terminal_uses_digest_not_immediate_telegram(
         digest_calls.append(msg)
     monkeypatch.setattr(scheduler.notify, "send", fake_send)
     monkeypatch.setattr(scheduler.notify, "queue_for_digest", fake_queue)
-    monkeypatch.setattr(scheduler, "_schedule_after", _async_noop)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
+    # "exceeded" is in USER_TERMINAL_KEYWORDS and not the special-cased
+    # 'already reserved' path.
     await scheduler._handle_failure(
-        rule, attempt=0, label="x", msg="already reserved", slot=slot
+        rule, attempt=0, label="x", msg="cap exceeded", slot=slot
     )
 
     assert send_calls == [], "no immediate Telegram for terminal failure"
@@ -371,7 +326,8 @@ async def test_class_full_at_window_open_chains_to_backup_when_set(
     monkeypatch, reset_loop_guard
 ):
     """Primary's class is full at window-open AND it has a backup configured:
-    polling MUST be skipped and the backup chain MUST fire immediately."""
+    chain MUST fire immediately, pushpress.book MUST NOT be called for the
+    primary, and the backup's booking job runs."""
     primary = _backup_rule(1, backup_rule_id=2)
     backup = _backup_rule(2, name="Backup A", class_category="Aerodance", backup_only=True)
     primary_slot = _ov_slot("cal-primary", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=0)
@@ -388,11 +344,6 @@ async def test_class_full_at_window_open_chains_to_backup_when_set(
         return None, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
     monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
 
-    polling_started = []
-    async def fake_start_polling(*a, **k):
-        polling_started.append((a, k))
-    monkeypatch.setattr(scheduler, "_start_polling", fake_start_polling)
-
     book_calls = []
     async def fake_book(uuid):
         from pushpress import BookingResult
@@ -403,26 +354,23 @@ async def test_class_full_at_window_open_chains_to_backup_when_set(
     monkeypatch.setattr(scheduler.notify, "send", _async_noop)
     monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
     monkeypatch.setattr(scheduler, "reminder_scan_job", _async_noop)
-    monkeypatch.setattr(scheduler, "_schedule_after", _async_noop)
-    monkeypatch.setattr(scheduler, "_advance_past_slot", _async_noop)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
     await scheduler.booking_window_job(1, 0, "cal-primary")
 
-    assert polling_started == [], (
-        "polling must be skipped when a backup_rule_id is set on the primary"
-    )
+    # Only the backup's slot should have been booked — primary's full slot
+    # gets skipped (full at window-open) and the chain takes over.
     assert book_calls == ["cal-backup"], (
         "backup's class should have been booked via the chain"
     )
 
 
 @pytest.mark.asyncio
-async def test_class_full_at_window_open_polls_when_no_backup(
+async def test_class_full_at_window_open_flags_user_when_no_backup(
     monkeypatch, reset_loop_guard
 ):
-    """Regression: when NO backup is set, the class-full branch must still
-    fall through to _start_polling (existing behavior preserved)."""
+    """Without a backup, a full class at window-open must FLAG the user
+    immediately (no polling, no retry — polling was removed)."""
     primary = _backup_rule(1)  # no backup_rule_id
     slot = _ov_slot("cal-full", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=0)
 
@@ -431,11 +379,6 @@ async def test_class_full_at_window_open_polls_when_no_backup(
         return slot
     monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
 
-    polling_started = []
-    async def fake_start_polling(*a, **k):
-        polling_started.append(True)
-    monkeypatch.setattr(scheduler, "_start_polling", fake_start_polling)
-
     book_calls = []
     async def fake_book(uuid):
         from pushpress import BookingResult
@@ -443,14 +386,19 @@ async def test_class_full_at_window_open_polls_when_no_backup(
         return BookingResult(ok=True, reservation_id="r", message="booked")
     monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
 
-    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    send_calls = []
+    async def fake_send(msg):
+        send_calls.append(msg)
+    monkeypatch.setattr(scheduler.notify, "send", fake_send)
     monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
     await scheduler.booking_window_job(1, 0, "cal-full")
 
-    assert polling_started == [True], "no backup configured ⇒ poll, do not chain"
-    assert book_calls == []
+    assert book_calls == [], "no book attempt when full at window-open"
+    assert any("full at window open" in m.lower() for m in send_calls), (
+        "must surface a Telegram flag for the user (no polling fallback)"
+    )
 
 
 @pytest.mark.asyncio
@@ -569,7 +517,8 @@ async def test_handle_failure_class_full_chains_when_backup_set(
     monkeypatch, reset_loop_guard
 ):
     """Class-full mid-flow (book call returned a class-full message) AND a
-    backup is configured → must chain, NOT start polling."""
+    backup is configured → must chain via _give_up_this_week. (Polling was
+    removed entirely; class-full is treated as terminal for this slot.)"""
     primary = _backup_rule(1, backup_rule_id=2)
     backup = _backup_rule(2, backup_only=True)
     primary_slot = _ov_slot("cal-p", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=2)
@@ -581,11 +530,6 @@ async def test_handle_failure_class_full_chains_when_backup_set(
         return backup_slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
     monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
 
-    polled = []
-    async def fake_start_polling(*a, **k):
-        polled.append(True)
-    monkeypatch.setattr(scheduler, "_start_polling", fake_start_polling)
-
     chain_calls = []
     async def fake_bwj(rule_id, attempt, uuid, **kwargs):
         chain_calls.append((rule_id, uuid))
@@ -593,7 +537,6 @@ async def test_handle_failure_class_full_chains_when_backup_set(
 
     monkeypatch.setattr(scheduler.notify, "send", _async_noop)
     monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
-    monkeypatch.setattr(scheduler, "_advance_past_slot", _async_noop)
     monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
 
     await scheduler._handle_failure(
@@ -601,7 +544,6 @@ async def test_handle_failure_class_full_chains_when_backup_set(
         msg="class is full, no spots", slot=primary_slot,
     )
 
-    assert polled == [], "primary with backup must skip polling"
     assert chain_calls == [(2, "cal-b")], "backup should have fired via the chain"
 
 
@@ -816,3 +758,81 @@ def test_from_class_as_backup_attaches_to_chain_tail(monkeypatch):
             db.commit()
 
     assert r.status_code == 303
+
+
+# ---- Horizon scan (multi-week pre-book) -----------------------------------
+
+
+def test_find_all_matching_slots_picks_every_matching_class():
+    """Across a 14-day window, the rule's matcher must return every class
+    that fits its day-of-week + time + location + category — not just the
+    nearest one. This is what makes multi-week pre-booking work."""
+    rule = make_rule(dow=2, hh=18, mm=30)
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=TZ)
+    # 3 Wed 18:30 slots within the next 14 days, plus a non-matching one.
+    week1 = _ov_slot("w1", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+    week2 = _ov_slot("w2", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+    week3 = _ov_slot("w3", datetime(2026, 6, 10, 18, 30, tzinfo=TZ))
+    wrong_day = _ov_slot("wd", datetime(2026, 5, 28, 18, 30, tzinfo=TZ))  # Thu
+    slots = [wrong_day, week2, week1, week3]
+
+    matches = scheduler.find_all_matching_slots(rule, slots, now)
+    assert [s.id for s in matches] == ["w1", "w2", "w3"], (
+        "must return all 3 matching weeks sorted by start time"
+    )
+
+
+@pytest.mark.asyncio
+async def test_horizon_scan_queues_one_job_per_matching_slot(monkeypatch):
+    """horizon_scan must queue a distinct booking job for every matching slot
+    in the lookahead — not just the next one. This is the multi-week
+    pre-booking behavior."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+    week2 = _ov_slot("w2", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+    week3 = _ov_slot("w3", datetime(2026, 6, 10, 18, 30, tzinfo=TZ))
+
+    queued_ids: list[str] = []
+
+    class FakeJob:
+        pass
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, **kwargs):
+            queued_ids.append(kwargs["id"])
+            return FakeJob()
+
+    monkeypatch.setattr(scheduler, "get_scheduler", lambda: FakeScheduler())
+
+    await scheduler.horizon_scan(
+        rule, all_slots=[week1, week2, week3], booked_class_ids=set()
+    )
+
+    assert sorted(queued_ids) == sorted([
+        "rule-1-slot-w1", "rule-1-slot-w2", "rule-1-slot-w3",
+    ]), "one job per matching slot, deterministic ids per slot"
+
+
+@pytest.mark.asyncio
+async def test_horizon_scan_skips_already_reserved_slots(monkeypatch):
+    """If a class is already in our reservations, skip it — don't queue a
+    booking job that would land in the 'already reserved' idempotent path."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", datetime(2026, 5, 27, 18, 30, tzinfo=TZ))
+    week2 = _ov_slot("w2", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+
+    queued_ids: list[str] = []
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, **kwargs):
+            queued_ids.append(kwargs["id"])
+
+    monkeypatch.setattr(scheduler, "get_scheduler", lambda: FakeScheduler())
+
+    await scheduler.horizon_scan(
+        rule, all_slots=[week1, week2], booked_class_ids={"w1"},
+    )
+
+    assert queued_ids == ["rule-1-slot-w2"], (
+        "w1 is already booked; only w2 should get queued"
+    )

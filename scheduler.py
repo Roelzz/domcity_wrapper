@@ -22,31 +22,20 @@ from settings import settings
 MAX_RETRIES = 5                 # transient retries only (network / 5xx)
 RETRY_DELAY_SEC = 30
 LOOKAHEAD_DAYS = 14
-MIN_HOURS_BEFORE_CLASS = 1      # stop polling this close to class start
 REMINDER_SCAN_INTERVAL_MIN = 15 # how often to refresh per-reservation reminders
 REMINDER_DAY_HOUR = 8           # local hour for the same-day reminder
 REMINDER_PRE_MIN = 30           # minutes before class start for the late reminder
 MAX_CHAIN_DEPTH = 5             # hard cap on backup-rule chain length
 
-# Substrings that mean the SLOT is full but could open up if someone cancels.
-# These rules switch into 12-hour polling mode instead of fast-retrying.
-CLASS_FULL_KEYWORDS = (
-    "class is full",
-    "fully booked",
-    "no spots",
-    "no spot available",
-    "no available spots",
-    "sold out",
-    "no longer available",
-    "capacity",          # "at capacity", "capacity reached"
-    "no space",
-    "waitlist",          # if returned as an error, treat as full
-)
-
 # Substrings about the USER's account — retrying won't help no matter how long.
 # Kept tight on purpose: a bare "expired" matches "Token expired" (transient!)
 # and a bare "cancelled" matches a gym-cancelled class (handled by the
 # class-vanished branch). Phrases must be specific enough to mean the user.
+# Any failure message that matches is treated as terminal for this slot;
+# the backup chain (if any) covers the cancellation-watch role that the
+# removed polling mechanism used to handle. Class-full keywords are included
+# so a mid-flow full-class response (rare race with the spot_check) doesn't
+# burn 5 retries.
 USER_TERMINAL_KEYWORDS = (
     "exceeded",
     "registration cap",
@@ -56,12 +45,17 @@ USER_TERMINAL_KEYWORDS = (
     "no active membership",
     "subscription is not active",
     "not allowed",
+    "class is full",
+    "fully booked",
+    "no spots",
+    "no spot available",
+    "no available spots",
+    "sold out",
+    "no longer available",
+    "capacity",
+    "no space",
+    "waitlist",
 )
-
-
-def _is_class_full(msg: str) -> bool:
-    low = (msg or "").lower()
-    return any(kw in low for kw in CLASS_FULL_KEYWORDS)
 
 
 def _is_user_terminal(msg: str) -> bool:
@@ -275,11 +269,33 @@ def next_class_datetime(rule: AutomationRule, now: datetime | None = None) -> da
     return target
 
 
+def _rule_matches(rule: AutomationRule, s, now: datetime) -> bool:
+    """Slot/rule predicate shared by find_next_matching_slot and horizon_scan."""
+    if rule.location and s.location.lower() != rule.location.lower():
+        return False
+    if rule.class_category and s.category.lower() != rule.class_category.lower():
+        return False
+    local = s.start.astimezone(tz())
+    if local.weekday() != rule.day_of_week:
+        return False
+    if local.time().hour != rule.time_of_day.hour:
+        return False
+    if local.time().minute != rule.time_of_day.minute:
+        return False
+    if local <= now:
+        return False
+    return not (rule.paused_until and local.date() <= rule.paused_until)
+
+
 async def find_next_matching_slot(
     rule: AutomationRule, after: datetime | None = None
 ):
     """Look up the next class in PushPress matching this rule. Returns
-    (ClassSlot, target_datetime) or (None, target_datetime_hint)."""
+    (ClassSlot, target_datetime) or (None, target_datetime_hint).
+
+    Kept for backward compat with manual-fire and the backup-chain lookup,
+    which both need a single "next" candidate. Horizon scheduling uses
+    find_all_matching_slots instead."""
     after = after or datetime.now(tz())
     hint = next_class_datetime(rule, now=after)
     start = hint.date() - timedelta(days=1)
@@ -289,27 +305,17 @@ async def find_next_matching_slot(
     except Exception as e:
         logger.warning("schedule fetch for rule {} failed: {}", rule.id, e)
         return None, hint
-    candidates = []
-    for s in slots:
-        if rule.location and s.location.lower() != rule.location.lower():
-            continue
-        if rule.class_category and s.category.lower() != rule.class_category.lower():
-            continue
-        local = s.start.astimezone(tz())
-        if local.weekday() != rule.day_of_week:
-            continue
-        if local.time().hour != rule.time_of_day.hour:
-            continue
-        if local.time().minute != rule.time_of_day.minute:
-            continue
-        if local <= after:
-            continue
-        # Skip anything on or before the rule's paused_until date.
-        if rule.paused_until and local.date() <= rule.paused_until:
-            continue
-        candidates.append(s)
+    candidates = [s for s in slots if _rule_matches(rule, s, after)]
     candidates.sort(key=lambda s: s.start)
     return (candidates[0] if candidates else None), hint
+
+
+def find_all_matching_slots(rule: AutomationRule, all_slots, now: datetime) -> list:
+    """Filter a pre-fetched schedule down to every slot this rule wants to
+    book within the lookahead. Sorted by start time."""
+    matches = [s for s in all_slots if _rule_matches(rule, s, now)]
+    matches.sort(key=lambda s: s.start)
+    return matches
 
 
 def window_open_time(slot) -> datetime:
@@ -319,11 +325,22 @@ def window_open_time(slot) -> datetime:
     return slot.start.astimezone(tz()) + timedelta(minutes=offset_min)
 
 
-async def reschedule_all() -> None:
+async def horizon_refresh_all() -> None:
+    """Refresh every enabled primary rule's horizon. Performs ONE schedule
+    fetch + ONE reservations fetch and reuses them across rules, so adding
+    a rule (or having ten) doesn't multiply API calls."""
     sch = get_scheduler()
+    # Clean slot-jobs upfront; horizon_scan adds the ones we still want.
     for job in list(sch.get_jobs()):
-        if job.id.startswith("rule-"):
+        if job.id.startswith("rule-") and "-slot-" in job.id:
             job.remove()
+        elif job.id.startswith("rule-") and job.id.endswith("-poll"):
+            # Legacy poll jobs from before the horizon migration.
+            job.remove()
+        elif job.id.startswith("rule-") and "-retry-" not in job.id and "-slot-" not in job.id:
+            # Legacy single-fire `rule-{id}` jobs from the pre-horizon era.
+            job.remove()
+
     with DbSession(engine) as db:
         rules = db.exec(
             select(AutomationRule).where(
@@ -331,40 +348,122 @@ async def reschedule_all() -> None:
                 AutomationRule.backup_only == False,  # noqa: E712
             )
         ).all()
+
+    if not rules:
+        return
+
+    # One schedule fetch shared across all rules.
+    today = datetime.now(tz()).date()
+    try:
+        all_slots = await pushpress.list_schedule(today, today + timedelta(days=LOOKAHEAD_DAYS))
+    except Exception as e:
+        logger.warning("horizon_refresh_all: schedule fetch failed: {}", e)
+        return
+
+    # One reservations fetch — used to skip already-booked slots so we don't
+    # spam PushPress with idempotent re-attempts.
+    try:
+        reservations = await pushpress.list_reservations()
+        booked_class_ids = {r.class_id for r in reservations}
+    except Exception as e:
+        logger.warning("horizon_refresh_all: reservations fetch failed: {}", e)
+        booked_class_ids = set()
+
     for rule in rules:
-        await schedule_rule(rule)
+        await horizon_scan(rule, all_slots=all_slots, booked_class_ids=booked_class_ids)
+
+
+async def horizon_scan(
+    rule: AutomationRule,
+    all_slots=None,
+    booked_class_ids: set[str] | None = None,
+) -> None:
+    """Queue a booking_window_job for every matching upcoming slot the rule
+    doesn't already have a reservation for. Idempotent: re-running replaces
+    existing slot-jobs (same job_id) and adds any new ones; orphan jobs for
+    slots no longer in the schedule were already cleaned by the caller's
+    horizon_refresh_all sweep.
+
+    `all_slots` and `booked_class_ids` are optional — they let the caller
+    share one PushPress fetch across many rules. When None we fetch our own."""
+    sch = get_scheduler()
+    now = datetime.now(tz())
+
+    if all_slots is None:
+        today = now.date()
+        try:
+            all_slots = await pushpress.list_schedule(
+                today, today + timedelta(days=LOOKAHEAD_DAYS)
+            )
+        except Exception as e:
+            logger.warning("horizon_scan rule {}: schedule fetch failed: {}", rule.id, e)
+            return
+
+    if booked_class_ids is None:
+        try:
+            reservations = await pushpress.list_reservations()
+            booked_class_ids = {r.class_id for r in reservations}
+        except Exception as e:
+            logger.warning("horizon_scan rule {}: reservations fetch failed: {}", rule.id, e)
+            booked_class_ids = set()
+
+    matches = find_all_matching_slots(rule, all_slots, now)
+    if not matches:
+        logger.info(
+            "Rule {} ('{}'): no matching classes in next {} days",
+            rule.id, rule.name, LOOKAHEAD_DAYS,
+        )
+        return
+
+    queued = 0
+    skipped_booked = 0
+    for slot in matches:
+        if slot.id in booked_class_ids:
+            skipped_booked += 1
+            continue
+        fire_at = window_open_time(slot)
+        if fire_at <= now:
+            fire_at = now + timedelta(seconds=2)
+        sch.add_job(
+            booking_window_job,
+            "date",
+            run_date=fire_at,
+            args=[rule.id, 0, slot.id],
+            id=f"rule-{rule.id}-slot-{slot.id}",
+            replace_existing=True,
+            misfire_grace_time=60,
+        )
+        queued += 1
+    logger.info(
+        "Rule {} ('{}'): queued {} bookings, skipped {} already-booked (of {} matching)",
+        rule.id, rule.name, queued, skipped_booked, len(matches),
+    )
+
+
+def schedule_horizon_refresh() -> None:
+    """Daily 03:30 cron that re-runs horizon_refresh_all to pick up newly-opened
+    windows and schedule changes. 03:30 sits between token refresh (03:00) and
+    daily digest (09:00) so the digest captures whatever changed overnight."""
+    sch = get_scheduler()
+    sch.add_job(
+        horizon_refresh_all,
+        "cron",
+        hour=3,
+        minute=30,
+        id="horizon-refresh",
+        replace_existing=True,
+    )
+    logger.info("Horizon refresh cron scheduled daily at 03:30 {}", settings.tz)
+
+
+# Backward-compat aliases for callers that still reference the old names.
+reschedule_all = horizon_refresh_all
 
 
 async def schedule_rule(rule: AutomationRule) -> None:
-    """Find the next matching class, schedule a job at its booking-window-open
-    time. If the window is already open, fire in 2 seconds."""
-    sch = get_scheduler()
-    job_id = f"rule-{rule.id}"
-    slot, hint = await find_next_matching_slot(rule)
-    if slot is None:
-        logger.warning(
-            "Rule {} ('{}'): no matching class in next {} days near {}; not scheduled",
-            rule.id, rule.name, LOOKAHEAD_DAYS, hint.isoformat(),
-        )
-        return
-    fire_at = window_open_time(slot)
-    now = datetime.now(tz())
-    if fire_at <= now:
-        # window already open — fire ASAP
-        fire_at = now + timedelta(seconds=2)
-    sch.add_job(
-        booking_window_job,
-        "date",
-        run_date=fire_at,
-        args=[rule.id, 0, slot.id],
-        id=job_id,
-        replace_existing=True,
-        misfire_grace_time=60,
-    )
-    logger.info(
-        "Scheduled rule {} ('{}') for {} (class {} at {})",
-        rule.id, rule.name, fire_at.isoformat(), slot.id, slot.start.isoformat(),
-    )
+    """Compat shim — queues a single rule's full horizon. Used by code paths
+    that mutate one rule and want to refresh just that rule's jobs."""
+    await horizon_scan(rule)
 
 
 async def next_window_open_async(rule: AutomationRule) -> datetime | None:
@@ -385,23 +484,19 @@ async def booking_window_job(
 ) -> None:
     """One-shot job: try to book the specific class this rule was queued for.
     Branches:
-      - success → log + notify + schedule next week's class
-      - class full at window-open → poll for cancellations, OR (when rule has
-        a backup_rule_id) chain straight to the backup
-      - user-terminal error (cap exceeded etc) → maybe chain + give up
+      - success → log + notify (no re-arm; the daily horizon cron handles that)
+      - class full at window-open → chain to backup if set, else flag user
+      - "already reserved" → silent no-op (idempotent, we have the booking)
+      - user-terminal error → maybe chain + give up
       - transient → retry every 30s up to MAX_RETRIES, then maybe chain
 
-    `calendar_item_uuid` is the slot _schedule_after / schedule_rule queued
-    this job for — it's the source of truth. We do NOT re-resolve "the next
-    matching slot" here, because that lookup is time-sensitive (a slot from
-    this week can re-appear if the job fires before its class starts) and
-    used to cause infinite loops re-booking the same idempotent reservation.
+    `calendar_item_uuid` is the slot horizon_scan queued this job for — the
+    source of truth. We do NOT re-resolve "next matching slot" here, which
+    historically caused infinite loops on the idempotent reservation.
 
-    `chained_from` carries the rule IDs already tried in the current backup
-    chain — used for cycle detection. `manual` bypasses the loop guard so a
-    user-initiated fire isn't suppressed by a recent scheduled fire of the
-    same rule.
-    """
+    `chained_from` carries rule IDs already tried in the backup chain for
+    cycle detection. `manual` bypasses the loop guard so a user-initiated
+    fire isn't suppressed by a recent scheduled fire of the same rule."""
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
         if not rule or not rule.enabled:
@@ -442,22 +537,19 @@ async def booking_window_job(
     target_label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
     logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
 
-    # Class full at window-open: poll for cancellations, UNLESS the rule has
-    # a backup configured — in that case the chain takes over immediately
-    # and polling is skipped (the user prefers a backup booking now over
-    # waiting for a cancellation).
+    # Class full at window-open: chain to backup if set, else flag the user.
+    # Polling was removed — the horizon scan + backup chain replace it.
     if (slot.spots_available or 0) <= 0:
         reason = (
             f"class full at window open "
             f"({slot.spots_available}/{slot.spots_total})"
         )
-        if rule.backup_rule_id is not None:
-            await _give_up_this_week(
-                rule, slot, target_label, reason,
-                chained_from=chained_from, notify_immediate=False,
-            )
-            return
-        return await _start_polling(rule, slot, target_label, reason)
+        await _give_up_this_week(
+            rule, slot, target_label, reason,
+            chained_from=chained_from,
+            notify_immediate=rule.backup_rule_id is None,
+        )
+        return
 
     try:
         result = await pushpress.book(slot.id)
@@ -472,8 +564,9 @@ async def booking_window_job(
         # Bump the reminder scan so reminders for THIS new reservation land
         # immediately instead of waiting up to 15 min for the next interval.
         await reminder_scan_job()
-        # Re-schedule for the FOLLOWING week (look past the slot we just booked).
-        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        # No per-success re-arm: every matching slot in the horizon already
+        # has its own queued job. The daily horizon cron catches anything
+        # the in-process scheduler missed (e.g. across a restart).
     else:
         await _handle_failure(
             rule, attempt, target_label, result.message,
@@ -493,203 +586,6 @@ async def _lookup_slot(calendar_item_uuid: str):
     return next((s for s in slots if s.id == calendar_item_uuid), None)
 
 
-async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
-    """Periodic check: did a spot open up for the full class this rule wants?
-    Fires every POLL_INTERVAL_HOURS hours, stops MIN_HOURS_BEFORE_CLASS before
-    class start."""
-    with DbSession(engine) as db:
-        rule = db.get(AutomationRule, rule_id)
-        if not rule or not rule.enabled:
-            logger.info("Rule {} missing or disabled, stopping poll", rule_id)
-            return
-
-    today = datetime.now(tz()).date()
-    try:
-        classes = await pushpress.list_schedule(today, today + timedelta(days=LOOKAHEAD_DAYS))
-    except Exception as e:
-        logger.warning("Poll fetch failed for rule {}: {}", rule_id, e)
-        # Try again next interval against a stale slot dummy
-        await _schedule_poll_retry(rule_id, calendar_item_uuid)
-        return
-
-    slot = next((c for c in classes if c.id == calendar_item_uuid), None)
-    if slot is None:
-        # Class has vanished — gym cancelled it, or it scrolled past the
-        # lookahead window. Either way, move on (and try backup if set).
-        label = f"{rule.name} (cal {calendar_item_uuid[:20]}…)"
-        await _give_up_this_week(
-            rule, None, label, "class no longer on schedule",
-            chained_from=None,
-        )
-        return
-
-    class_start = slot.start.astimezone(tz())
-    now = datetime.now(tz())
-    label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
-
-    if class_start <= now:
-        await _give_up_this_week(
-            rule, slot, label, "class started, never got a spot",
-            chained_from=None,
-        )
-        return
-
-    spots = slot.spots_available or 0
-    if spots <= 0:
-        # Still full — log + reschedule the next poll.
-        _record(rule.id, label, "polling", f"still full ({spots}/{slot.spots_total})")
-        logger.info("Rule {} poll: still full ({}/{})", rule_id, spots, slot.spots_total)
-        return await _schedule_poll(rule, slot)
-
-    # Spot opened up — race to book it.
-    logger.info("Rule {} poll: spot opened ({}/{}), attempting book", rule_id, spots, slot.spots_total)
-    try:
-        result = await pushpress.book(slot.id)
-    except Exception as e:
-        logger.warning("Book during poll raised: {}", e)
-        return await _schedule_poll(rule, slot)
-
-    if result.ok:
-        _record(rule.id, label, "success", "booked from poll")
-        await notify.send(f"✅ Booked from poll: {label}")
-        await reminder_scan_job()
-        await _schedule_after(rule, class_start + timedelta(minutes=1))
-        return
-
-    # Someone took it first / different error
-    if _is_user_terminal(result.message):
-        await _give_up_this_week(
-            rule, slot, label, f"terminal during poll: {result.message}",
-            chained_from=None, notify_immediate=False,
-        )
-        return
-    # Race lost, or some other recoverable error — keep polling
-    _record(rule.id, label, "polling", f"poll race lost: {result.message}")
-    await _schedule_poll(rule, slot)
-
-
-async def _start_polling(rule: AutomationRule, slot, label: str, reason: str) -> None:
-    _record(rule.id, label, "polling", reason)
-    # Polling-started is informational — goes to the daily digest, not an
-    # immediate Telegram. The user only needs to know if the poll ends in
-    # a final ✅ or ❌, which still fires immediately.
-    notify.queue_for_digest(
-        f"⏳ {rule.name}: class full at window-open, started polling"
-    )
-    await _schedule_poll(rule, slot)
-
-
-def _poll_interval_for(time_until_class: timedelta) -> timedelta:
-    """Adaptive poll cadence — tighter as the class approaches, because the
-    bulk of last-minute cancellations cluster in the final 24h.
-
-      > 48h:  12h
-      24h–48h: 4h
-      6h–24h:  1h
-      1h–6h:   15min
-      ≤1h:     handled by the deadline check, not this function
-    """
-    secs = time_until_class.total_seconds()
-    if secs > 48 * 3600:
-        return timedelta(hours=12)
-    if secs > 24 * 3600:
-        return timedelta(hours=4)
-    if secs > 6 * 3600:
-        return timedelta(hours=1)
-    return timedelta(minutes=15)
-
-
-async def _schedule_poll(rule: AutomationRule, slot) -> None:
-    """Schedule the next poll for this rule's target class, or give up if we're
-    too close to class start to keep trying. Note polling is only entered for
-    rules without a backup_rule_id — rules with backups skip polling and chain
-    immediately — so this give-up path doesn't need to thread chain context."""
-    sch = get_scheduler()
-    now = datetime.now(tz())
-    class_start = slot.start.astimezone(tz())
-    next_poll = now + _poll_interval_for(class_start - now)
-    deadline = class_start - timedelta(hours=MIN_HOURS_BEFORE_CLASS)
-    if next_poll > deadline:
-        # Out of time. Final failure for this week.
-        label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
-        await _give_up_this_week(
-            rule, slot, label, "class stayed full through booking window",
-            chained_from=None,
-        )
-        return
-    sch.add_job(
-        class_full_poll_job,
-        "date",
-        run_date=next_poll,
-        args=[rule.id, slot.id],
-        id=f"rule-{rule.id}-poll",
-        replace_existing=True,
-        misfire_grace_time=60 * 30,
-    )
-    logger.info(
-        "Polling rule {} ('{}') again at {} for class {}",
-        rule.id, rule.name, next_poll.isoformat(), slot.id,
-    )
-
-
-async def _schedule_poll_retry(rule_id: int, calendar_item_uuid: str) -> None:
-    """Short retry when the periodic fetch itself errored — try again in 1h."""
-    sch = get_scheduler()
-    sch.add_job(
-        class_full_poll_job,
-        "date",
-        run_date=datetime.now(tz()) + timedelta(hours=1),
-        args=[rule_id, calendar_item_uuid],
-        id=f"rule-{rule_id}-poll",
-        replace_existing=True,
-    )
-
-
-async def _schedule_after(rule: AutomationRule, after: datetime) -> None:
-    # Backup-only rules don't run on their own schedule — only when chained
-    # from a parent. Don't queue an APScheduler job for them.
-    if rule.backup_only:
-        return
-    sch = get_scheduler()
-    job_id = f"rule-{rule.id}"
-    slot, hint = await find_next_matching_slot(rule, after=after)
-    if not slot:
-        logger.warning(
-            "Rule {} ('{}'): no NEXT class found after {}", rule.id, rule.name, after.isoformat()
-        )
-        return
-    fire_at = window_open_time(slot)
-    now = datetime.now(tz())
-    if fire_at <= now:
-        fire_at = now + timedelta(seconds=2)
-    sch.add_job(
-        booking_window_job,
-        "date",
-        run_date=fire_at,
-        args=[rule.id, 0, slot.id],
-        id=job_id,
-        replace_existing=True,
-        misfire_grace_time=60,
-    )
-    logger.info(
-        "Re-scheduled rule {} ('{}') for {} (next class {} at {})",
-        rule.id, rule.name, fire_at.isoformat(), slot.id, slot.start.isoformat(),
-    )
-
-
-async def _advance_past_slot(rule: AutomationRule, slot) -> None:
-    """Reschedule the rule for the class AFTER `slot`. Used when the current
-    slot is unrecoverable (terminal failure, retries exhausted). Using
-    slot.start + 1min as the cutoff guarantees find_next_matching_slot
-    returns a DIFFERENT slot, breaking any retry loop. Falls back to a
-    7-day skip if slot is None (no anchor to advance past)."""
-    if slot is not None:
-        after = slot.start.astimezone(tz()) + timedelta(minutes=1)
-    else:
-        after = next_class_datetime(rule, datetime.now(tz())) + timedelta(days=1)
-    await _schedule_after(rule, after)
-
-
 async def _handle_failure(
     rule: AutomationRule,
     attempt: int,
@@ -700,21 +596,20 @@ async def _handle_failure(
 ) -> None:
     logger.warning("Rule {} attempt {} failed: {}", rule.id, attempt + 1, msg)
 
-    # Class-full mid-flow → poll for cancellations, UNLESS a backup is
-    # configured (in which case skip polling and chain immediately).
-    if slot is not None and _is_class_full(msg):
-        if rule.backup_rule_id is not None:
-            await _give_up_this_week(
-                rule, slot, label, msg,
-                chained_from=chained_from, notify_immediate=False,
-            )
-            return
-        await _start_polling(rule, slot, label, msg)
+    low = (msg or "").lower()
+
+    # "Already reserved" is idempotent — we have the booking, nothing to do.
+    # Critically: do NOT chain to backup here, because that would book a backup
+    # class even though the primary is already secured.
+    if "already reserved" in low:
+        logger.info("Rule {} attempt {}: {} — already booked, silent skip",
+                    rule.id, attempt + 1, label)
+        _record(rule.id, label, "success", "already reserved (idempotent)")
         return
 
     # User-side terminal → give up on THIS slot (and chain to backup if set).
-    # Quiet path: digest instead of immediate Telegram — the rule already
-    # gave up, nothing for the user to act on right now.
+    # Class-full is treated the same as any other terminal: chain or flag.
+    # Polling was removed — backups replace the cancellation-watch path.
     if _is_user_terminal(msg):
         await _give_up_this_week(
             rule, slot, label, f"terminal: {msg}",
@@ -732,8 +627,6 @@ async def _handle_failure(
         return
     _record(rule.id, label, "retry", msg)
     run_at = datetime.now(tz()) + timedelta(seconds=RETRY_DELAY_SEC)
-    # Retry the SAME slot — pass slot.id forward. If slot is somehow None at
-    # this point, there's no slot to retry.
     if slot is None:
         return
     retry_kwargs = {"chained_from": chained_from} if chained_from else None
@@ -757,15 +650,14 @@ async def _give_up_this_week(
     chained_from: set[int] | None = None,
     notify_immediate: bool = True,
 ) -> None:
-    """Single exit point for 'this slot can't be booked this week'. Records
-    the failure, fires the backup chain if one is configured, and re-schedules
-    the primary for next week (backup-only rules opt out of re-scheduling via
-    _schedule_after / _advance_past_slot).
+    """Single exit point for 'this slot can't be booked'. Records the failure
+    and fires the backup chain if one is configured. The horizon model already
+    has the rule's other matching slots queued, so there's no re-arm to do
+    here — each week is an independent job.
 
     `chained_from` carries the visited set so a chained give-up doesn't loop.
     `notify_immediate=False` routes the user-facing message to the daily digest
-    instead of an immediate Telegram — for terminal/quiet failures where the
-    user has nothing to act on right now."""
+    for quiet failures where the user has nothing to act on right now."""
     _record(rule.id, target_label, "failure", reason)
     visited = (chained_from or set()) | {rule.id}
     if slot is not None:
@@ -775,17 +667,12 @@ async def _give_up_this_week(
 
     chained = await _chain_to_backup(rule, target_start, visited, reason)
     if not chained:
-        # No backup picked it up — surface to the user.
+        # No backup picked it up — flag the user.
         msg = f"❌ {rule.name}: {reason}"
         if notify_immediate:
             await notify.send(msg)
         else:
             notify.queue_for_digest(msg)
-
-    if slot is not None:
-        await _advance_past_slot(rule, slot)
-    else:
-        await _schedule_after(rule, target_start + timedelta(days=1))
 
 
 async def _chain_to_backup(
