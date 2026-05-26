@@ -26,6 +26,7 @@ MIN_HOURS_BEFORE_CLASS = 1      # stop polling this close to class start
 REMINDER_SCAN_INTERVAL_MIN = 15 # how often to refresh per-reservation reminders
 REMINDER_DAY_HOUR = 8           # local hour for the same-day reminder
 REMINDER_PRE_MIN = 30           # minutes before class start for the late reminder
+MAX_CHAIN_DEPTH = 5             # hard cap on backup-rule chain length
 
 # Substrings that mean the SLOT is full but could open up if someone cancels.
 # These rules switch into 12-hour polling mode instead of fast-retrying.
@@ -324,7 +325,12 @@ async def reschedule_all() -> None:
         if job.id.startswith("rule-"):
             job.remove()
     with DbSession(engine) as db:
-        rules = db.exec(select(AutomationRule).where(AutomationRule.enabled == True)).all()  # noqa: E712
+        rules = db.exec(
+            select(AutomationRule).where(
+                AutomationRule.enabled == True,  # noqa: E712
+                AutomationRule.backup_only == False,  # noqa: E712
+            )
+        ).all()
     for rule in rules:
         await schedule_rule(rule)
 
@@ -371,20 +377,30 @@ async def next_window_open_async(rule: AutomationRule) -> datetime | None:
 
 
 async def booking_window_job(
-    rule_id: int, attempt: int, calendar_item_uuid: str
+    rule_id: int,
+    attempt: int,
+    calendar_item_uuid: str,
+    chained_from: set[int] | None = None,
+    manual: bool = False,
 ) -> None:
     """One-shot job: try to book the specific class this rule was queued for.
     Branches:
       - success → log + notify + schedule next week's class
-      - class full → switch to 12h poll mode (no spamming)
-      - user-terminal error (cap exceeded etc) → log + give up + next week
-      - transient → retry every 30s up to MAX_RETRIES
+      - class full at window-open → poll for cancellations, OR (when rule has
+        a backup_rule_id) chain straight to the backup
+      - user-terminal error (cap exceeded etc) → maybe chain + give up
+      - transient → retry every 30s up to MAX_RETRIES, then maybe chain
 
     `calendar_item_uuid` is the slot _schedule_after / schedule_rule queued
     this job for — it's the source of truth. We do NOT re-resolve "the next
     matching slot" here, because that lookup is time-sensitive (a slot from
     this week can re-appear if the job fires before its class starts) and
     used to cause infinite loops re-booking the same idempotent reservation.
+
+    `chained_from` carries the rule IDs already tried in the current backup
+    chain — used for cycle detection. `manual` bypasses the loop guard so a
+    user-initiated fire isn't suppressed by a recent scheduled fire of the
+    same rule.
     """
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
@@ -393,34 +409,32 @@ async def booking_window_job(
             return
 
     now = datetime.now(tz())
-    last = _last_fire_at.get(rule_id)
-    if last is not None and (now - last).total_seconds() < LOOP_GUARD_WINDOW_SEC:
-        elapsed = (now - last).total_seconds()
-        logger.error(
-            "Rule {} firing too fast (last {:.1f}s ago), aborting to break loop",
-            rule_id, elapsed,
-        )
-        notify.queue_for_digest(
-            f"⚠️ rule {rule_id} ('{rule.name}') loop-guarded ({elapsed:.0f}s)"
-        )
-        return
-    _last_fire_at[rule_id] = now
+    if not manual:
+        last = _last_fire_at.get(rule_id)
+        if last is not None and (now - last).total_seconds() < LOOP_GUARD_WINDOW_SEC:
+            elapsed = (now - last).total_seconds()
+            logger.error(
+                "Rule {} firing too fast (last {:.1f}s ago), aborting to break loop",
+                rule_id, elapsed,
+            )
+            notify.queue_for_digest(
+                f"⚠️ rule {rule_id} ('{rule.name}') loop-guarded ({elapsed:.0f}s)"
+            )
+            return
+        _last_fire_at[rule_id] = now
 
     slot = await _lookup_slot(calendar_item_uuid)
     if slot is None:
         # Slot vanished between scheduling and firing (gym cancelled / past).
-        # Advance to the next matching class instead of retrying this one.
         label = f"{rule.name} (cal {calendar_item_uuid[:20]}…)"
         logger.warning(
             "Firing rule {} attempt {}: target slot {} no longer on schedule",
             rule_id, attempt + 1, calendar_item_uuid,
         )
-        _record(rule.id, label, "failure", "target class disappeared before booking")
-        notify.queue_for_digest(
-            f"⚠️ {rule.name}: target class disappeared before booking window opened"
-        )
-        await _schedule_after(
-            rule, next_class_datetime(rule, now) + timedelta(days=1)
+        await _give_up_this_week(
+            rule, None, label,
+            "target class disappeared before booking",
+            chained_from=chained_from, notify_immediate=False,
         )
         return
 
@@ -428,17 +442,30 @@ async def booking_window_job(
     target_label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
     logger.info("Firing rule {} attempt {}: {}", rule_id, attempt + 1, target_label)
 
-    # If the class is already full at window-open, skip the booking attempt
-    # entirely and start polling for an opening.
+    # Class full at window-open: poll for cancellations, UNLESS the rule has
+    # a backup configured — in that case the chain takes over immediately
+    # and polling is skipped (the user prefers a backup booking now over
+    # waiting for a cancellation).
     if (slot.spots_available or 0) <= 0:
-        return await _start_polling(
-            rule, slot, target_label, f"class full at window open ({slot.spots_available}/{slot.spots_total})"
+        reason = (
+            f"class full at window open "
+            f"({slot.spots_available}/{slot.spots_total})"
         )
+        if rule.backup_rule_id is not None:
+            await _give_up_this_week(
+                rule, slot, target_label, reason,
+                chained_from=chained_from, notify_immediate=False,
+            )
+            return
+        return await _start_polling(rule, slot, target_label, reason)
 
     try:
         result = await pushpress.book(slot.id)
     except Exception as e:
-        return await _handle_failure(rule, attempt, target_label, f"book call raised: {e}", slot=slot)
+        return await _handle_failure(
+            rule, attempt, target_label, f"book call raised: {e}",
+            slot=slot, chained_from=chained_from,
+        )
     if result.ok:
         _record(rule.id, target_label, "success", result.message or "booked")
         await notify.send(f"✅ Booked: {target_label}")
@@ -448,7 +475,10 @@ async def booking_window_job(
         # Re-schedule for the FOLLOWING week (look past the slot we just booked).
         await _schedule_after(rule, class_start + timedelta(minutes=1))
     else:
-        await _handle_failure(rule, attempt, target_label, result.message, slot=slot)
+        await _handle_failure(
+            rule, attempt, target_label, result.message,
+            slot=slot, chained_from=chained_from,
+        )
 
 
 async def _lookup_slot(calendar_item_uuid: str):
@@ -485,13 +515,12 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
     slot = next((c for c in classes if c.id == calendar_item_uuid), None)
     if slot is None:
         # Class has vanished — gym cancelled it, or it scrolled past the
-        # lookahead window. Either way, move on to next week's class.
-        # `after=now` is safe because the vanished slot is no longer in the
-        # schedule and therefore cannot be re-selected by find_next_matching_slot.
+        # lookahead window. Either way, move on (and try backup if set).
         label = f"{rule.name} (cal {calendar_item_uuid[:20]}…)"
-        _record(rule.id, label, "failure", "class no longer on schedule")
-        await notify.send(f"❌ {rule.name}: target class disappeared from the schedule")
-        await _schedule_after(rule, datetime.now(tz()))
+        await _give_up_this_week(
+            rule, None, label, "class no longer on schedule",
+            chained_from=None,
+        )
         return
 
     class_start = slot.start.astimezone(tz())
@@ -499,9 +528,10 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
     label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
 
     if class_start <= now:
-        _record(rule.id, label, "failure", "class started, never got a spot")
-        await notify.send(f"❌ {rule.name}: class started, never got a spot")
-        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        await _give_up_this_week(
+            rule, slot, label, "class started, never got a spot",
+            chained_from=None,
+        )
         return
 
     spots = slot.spots_available or 0
@@ -528,11 +558,10 @@ async def class_full_poll_job(rule_id: int, calendar_item_uuid: str) -> None:
 
     # Someone took it first / different error
     if _is_user_terminal(result.message):
-        _record(rule.id, label, "failure", f"terminal during poll: {result.message}")
-        notify.queue_for_digest(
-            f"❌ Poll booking failed (terminal): {label}\n{result.message}"
+        await _give_up_this_week(
+            rule, slot, label, f"terminal during poll: {result.message}",
+            chained_from=None, notify_immediate=False,
         )
-        await _schedule_after(rule, class_start + timedelta(minutes=1))
         return
     # Race lost, or some other recoverable error — keep polling
     _record(rule.id, label, "polling", f"poll race lost: {result.message}")
@@ -572,18 +601,21 @@ def _poll_interval_for(time_until_class: timedelta) -> timedelta:
 
 async def _schedule_poll(rule: AutomationRule, slot) -> None:
     """Schedule the next poll for this rule's target class, or give up if we're
-    too close to class start to keep trying."""
+    too close to class start to keep trying. Note polling is only entered for
+    rules without a backup_rule_id — rules with backups skip polling and chain
+    immediately — so this give-up path doesn't need to thread chain context."""
     sch = get_scheduler()
     now = datetime.now(tz())
     class_start = slot.start.astimezone(tz())
     next_poll = now + _poll_interval_for(class_start - now)
     deadline = class_start - timedelta(hours=MIN_HOURS_BEFORE_CLASS)
     if next_poll > deadline:
-        # Out of time. Final failure, advance to next week.
+        # Out of time. Final failure for this week.
         label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
-        _record(rule.id, label, "failure", "class stayed full through booking window")
-        await notify.send(f"❌ {rule.name}: class stayed full, never got a spot")
-        await _schedule_after(rule, class_start + timedelta(minutes=1))
+        await _give_up_this_week(
+            rule, slot, label, "class stayed full through booking window",
+            chained_from=None,
+        )
         return
     sch.add_job(
         class_full_poll_job,
@@ -614,6 +646,10 @@ async def _schedule_poll_retry(rule_id: int, calendar_item_uuid: str) -> None:
 
 
 async def _schedule_after(rule: AutomationRule, after: datetime) -> None:
+    # Backup-only rules don't run on their own schedule — only when chained
+    # from a parent. Don't queue an APScheduler job for them.
+    if rule.backup_only:
+        return
     sch = get_scheduler()
     job_id = f"rule-{rule.id}"
     slot, hint = await find_next_matching_slot(rule, after=after)
@@ -655,48 +691,171 @@ async def _advance_past_slot(rule: AutomationRule, slot) -> None:
 
 
 async def _handle_failure(
-    rule: AutomationRule, attempt: int, label: str, msg: str, slot=None
+    rule: AutomationRule,
+    attempt: int,
+    label: str,
+    msg: str,
+    slot=None,
+    chained_from: set[int] | None = None,
 ) -> None:
     logger.warning("Rule {} attempt {} failed: {}", rule.id, attempt + 1, msg)
 
-    # Class-full → switch to 12h poll mode (only if we know which slot)
+    # Class-full mid-flow → poll for cancellations, UNLESS a backup is
+    # configured (in which case skip polling and chain immediately).
     if slot is not None and _is_class_full(msg):
+        if rule.backup_rule_id is not None:
+            await _give_up_this_week(
+                rule, slot, label, msg,
+                chained_from=chained_from, notify_immediate=False,
+            )
+            return
         await _start_polling(rule, slot, label, msg)
         return
 
-    # User-side terminal → give up on THIS slot, advance to the next match.
-    # Quiet path: route to digest, not immediate Telegram — the rule already
-    # gave up, nothing for the user to do right now.
+    # User-side terminal → give up on THIS slot (and chain to backup if set).
+    # Quiet path: digest instead of immediate Telegram — the rule already
+    # gave up, nothing for the user to act on right now.
     if _is_user_terminal(msg):
-        _record(rule.id, label, "failure", f"terminal: {msg}")
-        notify.queue_for_digest(f"❌ Failed (terminal): {label}\n{msg}")
-        await _advance_past_slot(rule, slot)
+        await _give_up_this_week(
+            rule, slot, label, f"terminal: {msg}",
+            chained_from=chained_from, notify_immediate=False,
+        )
         return
 
-    # Transient → retry every 30s up to MAX_RETRIES
+    # Transient → retry every 30s up to MAX_RETRIES, then give up + maybe chain.
     if attempt + 1 >= MAX_RETRIES:
-        _record(rule.id, label, "failure", msg)
-        notify.queue_for_digest(
-            f"❌ Failed (gave up after {MAX_RETRIES} retries): {label}\n{msg}"
+        await _give_up_this_week(
+            rule, slot, label,
+            f"gave up after {MAX_RETRIES} retries: {msg}",
+            chained_from=chained_from, notify_immediate=False,
         )
-        await _advance_past_slot(rule, slot)
         return
     _record(rule.id, label, "retry", msg)
     run_at = datetime.now(tz()) + timedelta(seconds=RETRY_DELAY_SEC)
     # Retry the SAME slot — pass slot.id forward. If slot is somehow None at
-    # this point (find_next_matching_slot returned nothing), there's no slot
-    # to retry, so we'd have already taken the user-terminal/no-class branch
-    # via _handle_failure(slot=None) on the next call.
+    # this point, there's no slot to retry.
     if slot is None:
         return
+    retry_kwargs = {"chained_from": chained_from} if chained_from else None
     get_scheduler().add_job(
         booking_window_job,
         "date",
         run_date=run_at,
         args=[rule.id, attempt + 1, slot.id],
+        kwargs=retry_kwargs,
         id=f"rule-{rule.id}-retry-{attempt + 1}",
         replace_existing=True,
     )
+
+
+async def _give_up_this_week(
+    rule: AutomationRule,
+    slot,
+    target_label: str,
+    reason: str,
+    *,
+    chained_from: set[int] | None = None,
+    notify_immediate: bool = True,
+) -> None:
+    """Single exit point for 'this slot can't be booked this week'. Records
+    the failure, fires the backup chain if one is configured, and re-schedules
+    the primary for next week (backup-only rules opt out of re-scheduling via
+    _schedule_after / _advance_past_slot).
+
+    `chained_from` carries the visited set so a chained give-up doesn't loop.
+    `notify_immediate=False` routes the user-facing message to the daily digest
+    instead of an immediate Telegram — for terminal/quiet failures where the
+    user has nothing to act on right now."""
+    _record(rule.id, target_label, "failure", reason)
+    visited = (chained_from or set()) | {rule.id}
+    if slot is not None:
+        target_start = slot.start.astimezone(tz())
+    else:
+        target_start = next_class_datetime(rule, datetime.now(tz()))
+
+    chained = await _chain_to_backup(rule, target_start, visited, reason)
+    if not chained:
+        # No backup picked it up — surface to the user.
+        msg = f"❌ {rule.name}: {reason}"
+        if notify_immediate:
+            await notify.send(msg)
+        else:
+            notify.queue_for_digest(msg)
+
+    if slot is not None:
+        await _advance_past_slot(rule, slot)
+    else:
+        await _schedule_after(rule, target_start + timedelta(days=1))
+
+
+async def _chain_to_backup(
+    parent: AutomationRule,
+    target_class_start: datetime,
+    visited: set[int],
+    reason: str,
+) -> bool:
+    """Walk the backup chain starting at `parent.backup_rule_id`. Returns True
+    if a backup successfully fired its booking_window_job, False if there's no
+    backup configured, the chain has no fireable link, or the depth cap is hit.
+
+    `visited` is the set of rule IDs already tried in this chain (including
+    `parent.id`). Cycle detection rejects any backup whose ID is already in
+    `visited`. The depth cap is MAX_CHAIN_DEPTH, comparing against `len(visited)`."""
+    if parent.backup_rule_id is None:
+        return False
+    if len(visited) >= MAX_CHAIN_DEPTH:
+        logger.warning(
+            "Backup chain depth cap ({}) hit at rule {}; not chaining further",
+            MAX_CHAIN_DEPTH, parent.id,
+        )
+        notify.queue_for_digest(
+            f"⚠️ {parent.name}: backup chain hit depth cap"
+        )
+        return False
+    with DbSession(engine) as db:
+        backup = db.get(AutomationRule, parent.backup_rule_id)
+    if backup is None:
+        logger.warning(
+            "Rule {} has backup_rule_id={} but that rule doesn't exist",
+            parent.id, parent.backup_rule_id,
+        )
+        return False
+    if backup.id in visited:
+        logger.error(
+            "Backup chain cycle: rule {} already visited {}", backup.id, visited
+        )
+        return False
+    if not backup.enabled:
+        logger.info(
+            "Backup rule {} ('{}') is disabled, skipping to its own backup",
+            backup.id, backup.name,
+        )
+        return await _chain_to_backup(
+            backup, target_class_start, visited | {backup.id}, reason
+        )
+    # Find a matching slot for the backup around the failed target's week.
+    week_anchor = target_class_start - timedelta(days=2)
+    slot, _ = await find_next_matching_slot(backup, after=week_anchor)
+    if slot is None:
+        logger.info(
+            "Backup rule {} ('{}'): no matching slot near {}, trying next in chain",
+            backup.id, backup.name, target_class_start.isoformat(),
+        )
+        return await _chain_to_backup(
+            backup, target_class_start, visited | {backup.id}, reason
+        )
+    logger.info(
+        "Chaining rule {} → backup {} ('{}') for class {} (reason: {})",
+        parent.id, backup.id, backup.name, slot.id, reason,
+    )
+    notify.queue_for_digest(
+        f"↦ {parent.name} failed, trying backup {backup.name}"
+    )
+    await booking_window_job(
+        backup.id, 0, slot.id,
+        chained_from=visited,
+    )
+    return True
 
 
 def _record(rule_id: int, target: str, status: str, message: str) -> None:

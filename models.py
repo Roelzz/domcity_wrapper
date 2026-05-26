@@ -23,6 +23,13 @@ class AutomationRule(SQLModel, table=True):
     # Cleared (set to None) to resume. Lets the user skip a holiday without
     # toggling individual rules manually.
     paused_until: date | None = Field(default=None)
+    # Fallback chain: when this rule fails (class full at window-open, terminal
+    # error, etc.), immediately try to book the rule pointed to by backup_rule_id.
+    # Backups can themselves have backups — the chain is followed up to a depth
+    # cap (see scheduler.MAX_CHAIN_DEPTH). backup_only rules never fire on their
+    # own schedule, only when chained from a parent.
+    backup_rule_id: int | None = Field(default=None, foreign_key="automationrule.id")
+    backup_only: bool = Field(default=False)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -47,6 +54,7 @@ class TokenCache(SQLModel, table=True):
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _ensure_paused_until_column()
+    _ensure_backup_columns()
 
 
 def _ensure_paused_until_column() -> None:
@@ -58,4 +66,25 @@ def _ensure_paused_until_column() -> None:
         names = {row[1] for row in cols}
         if "paused_until" not in names:
             db.exec(text("ALTER TABLE automationrule ADD COLUMN paused_until DATE"))
+            db.commit()
+
+
+def _ensure_backup_columns() -> None:
+    """Lightweight 'migration' for the backup_rule_id / backup_only columns."""
+    with Session(engine) as db:
+        cols = db.exec(text("PRAGMA table_info(automationrule)")).all()
+        names = {row[1] for row in cols}
+        changed = False
+        if "backup_rule_id" not in names:
+            db.exec(text("ALTER TABLE automationrule ADD COLUMN backup_rule_id INTEGER"))
+            changed = True
+        if "backup_only" not in names:
+            db.exec(
+                text(
+                    "ALTER TABLE automationrule ADD COLUMN backup_only BOOLEAN "
+                    "DEFAULT 0 NOT NULL"
+                )
+            )
+            changed = True
+        if changed:
             db.commit()

@@ -370,10 +370,33 @@ async def automation_page(
     prefill_time: str | None = None,
 ):
     with DbSession(engine) as db:
-        rules = db.exec(select(AutomationRule).order_by(AutomationRule.day_of_week)).all()
+        all_rules = db.exec(
+            select(AutomationRule).order_by(AutomationRule.day_of_week)
+        ).all()
         attempts = db.exec(
             select(BookingAttempt).order_by(BookingAttempt.fired_at.desc()).limit(20)
         ).all()
+
+    # Top-level list = primary (non-backup_only) rules. Backup-only rules are
+    # rendered nested under whichever primary owns them via the chain map.
+    rules = [r for r in all_rules if not r.backup_only]
+    rules_by_id = {r.id: r for r in all_rules}
+
+    # Build the chain map: rule_id -> ordered list of backup rules (the chain
+    # starting at this rule, excluding the rule itself). Stop at cycles / cap.
+    backup_chains: dict[int, list[AutomationRule]] = {}
+    for r in rules:
+        chain: list[AutomationRule] = []
+        seen = {r.id}
+        cur = r
+        while cur.backup_rule_id is not None and len(chain) < scheduler.MAX_CHAIN_DEPTH:
+            nxt = rules_by_id.get(cur.backup_rule_id)
+            if nxt is None or nxt.id in seen:
+                break
+            chain.append(nxt)
+            seen.add(nxt.id)
+            cur = nxt
+        backup_chains[r.id] = chain
 
     classes = await _fetch_classes_for_automation()
     categories = sorted({c.category for c in classes if c.category})
@@ -400,6 +423,7 @@ async def automation_page(
     ctx = {
         "active": "automation",
         "rules": rules,
+        "backup_chains": backup_chains,
         "attempts": attempts,
         "next_fires": next_fires,
         "days": list(enumerate(DAYS_LONG)),
@@ -599,6 +623,14 @@ async def automation_delete(rule_id: int):
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
         if rule:
+            # Cascade-clear backup_rule_id pointers pointing at this rule so
+            # no other rule is left dangling.
+            referring = db.exec(
+                select(AutomationRule).where(AutomationRule.backup_rule_id == rule_id)
+            ).all()
+            for r in referring:
+                r.backup_rule_id = None
+                db.add(r)
             db.delete(rule)
             db.commit()
     await scheduler.reschedule_all()
@@ -629,7 +661,8 @@ async def automation_pause_until(rule_id: int, paused_until: str = Form("")):
 async def automation_fire(rule_id: int):
     """Manually trigger booking_window_job for this rule right now. Useful
     for testing or to force an immediate attempt when the cron hasn't fired
-    yet."""
+    yet. Resolves the next matching slot first so the job has its required
+    calendar_item_uuid; bypasses the loop guard via manual=True."""
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
         if not rule:
@@ -637,7 +670,88 @@ async def automation_fire(rule_id: int):
         if not rule.enabled:
             raise HTTPException(400, "rule is paused")
     logger.info("Manually firing rule {} ('{}')", rule_id, rule.name)
-    await scheduler.booking_window_job(rule_id, 0)
+    slot, _ = await scheduler.find_next_matching_slot(rule)
+    if slot is None:
+        raise HTTPException(400, "no matching class found in next 14 days")
+    await scheduler.booking_window_job(rule_id, 0, slot.id, manual=True)
+    return RedirectResponse("/automation", status_code=303)
+
+
+@app.post("/automation/{rule_id}/add-backup")
+async def automation_add_backup(
+    rule_id: int,
+    name: str = Form(...),
+    class_category: str = Form(...),
+    location: str = Form(...),
+    day_of_week: int = Form(...),
+    time_of_day: str = Form(...),  # "HH:MM"
+):
+    """Create a new backup_only rule and attach it to the tail of this rule's
+    existing backup chain. Grows the chain progressively without forcing the
+    user to think about ordering — each click appends one more fallback link."""
+    try:
+        hh, mm = (int(x) for x in time_of_day.split(":")[:2])
+    except (ValueError, AttributeError) as e:
+        raise HTTPException(400, f"Bad time: {e}") from e
+
+    with DbSession(engine) as db:
+        primary = db.get(AutomationRule, rule_id)
+        if not primary:
+            raise HTTPException(404)
+        # Walk to the tail of the existing chain so we attach to the last link.
+        tail = primary
+        depth = 1
+        visited = {primary.id}
+        while tail.backup_rule_id is not None:
+            if depth >= scheduler.MAX_CHAIN_DEPTH:
+                raise HTTPException(400, "chain already at depth cap")
+            nxt = db.get(AutomationRule, tail.backup_rule_id)
+            if nxt is None or nxt.id in visited:
+                break
+            visited.add(nxt.id)
+            tail = nxt
+            depth += 1
+
+        new_rule = AutomationRule(
+            name=name.strip() or f"{DAYS_LONG[day_of_week]} {class_category}",
+            location=location.strip(),
+            class_category=class_category.strip(),
+            day_of_week=day_of_week,
+            time_of_day=time(hour=hh, minute=mm),
+            enabled=True,
+            backup_only=True,
+        )
+        db.add(new_rule)
+        db.flush()  # get new_rule.id
+        tail.backup_rule_id = new_rule.id
+        db.add(tail)
+        db.commit()
+
+    await scheduler.reschedule_all()
+    return RedirectResponse("/automation", status_code=303)
+
+
+@app.post("/automation/{rule_id}/remove-backup")
+async def automation_remove_backup(rule_id: int):
+    """Remove the immediate backup of this rule. Deletes the backup_only rule
+    pointed to and re-parents its own backup (if any) to this rule so the rest
+    of the chain stays intact."""
+    with DbSession(engine) as db:
+        rule = db.get(AutomationRule, rule_id)
+        if not rule:
+            raise HTTPException(404)
+        if rule.backup_rule_id is None:
+            raise HTTPException(400, "no backup to remove")
+        backup = db.get(AutomationRule, rule.backup_rule_id)
+        # Re-parent: rule's new backup is the removed backup's own backup.
+        rule.backup_rule_id = backup.backup_rule_id if backup else None
+        db.add(rule)
+        if backup is not None and backup.backup_only:
+            # Only delete it if we created it as a dedicated backup. Standalone
+            # rules that someone wired up as a backup should be left alone.
+            db.delete(backup)
+        db.commit()
+    await scheduler.reschedule_all()
     return RedirectResponse("/automation", status_code=303)
 
 

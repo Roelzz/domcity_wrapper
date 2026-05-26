@@ -88,6 +88,64 @@
                 </form>
               </td>
             </tr>
+            <tr class="backup-row">
+              <td colspan="8" style="border-top:0;padding-top:.25rem;">
+                {% set chain = backup_chains.get(r.id, []) %}
+                {% if chain %}
+                  <div class="backup-chain" style="display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;font-size:.8rem;">
+                    {% set prev_ns = namespace(id=r.id) %}
+                    {% for b in chain %}
+                      <span class="muted">↦</span>
+                      <span class="tag" title="{{ b.class_category }} · {{ b.location }} · {{ day_short[b.day_of_week] }} {{ b.time_of_day.strftime('%H:%M') }}">
+                        Backup {{ loop.index }}: <strong>{{ b.name }}</strong>
+                        <small class="muted">{{ b.class_category }} · {{ b.location }} · {{ day_short[b.day_of_week] }} {{ b.time_of_day.strftime('%H:%M') }}</small>
+                      </span>
+                      <form method="post" action="/automation/{{ prev_ns.id }}/remove-backup" style="display:inline;margin:0;"
+                            onsubmit="return confirm('Remove this backup?')">
+                        <button class="contrast outline small" title="Remove this backup link">×</button>
+                      </form>
+                      {% set prev_ns.id = b.id %}
+                    {% endfor %}
+                  </div>
+                {% endif %}
+                <details style="margin-top:.4rem;">
+                  <summary class="muted" style="cursor:pointer;font-size:.8rem;">+ Add backup{% if chain %} (after backup {{ chain|length }}){% endif %}</summary>
+                  <form method="post" action="/automation/{{ r.id }}/add-backup" class="backup-form"
+                        style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.5rem;margin-top:.5rem;align-items:end;">
+                    <label style="margin:0;">
+                      <small>Name</small>
+                      <input name="name" required placeholder="e.g. Mon Aerodance OV" style="font-size:.8rem;" />
+                    </label>
+                    <label style="margin:0;">
+                      <small>Training</small>
+                      <select name="class_category" required style="font-size:.8rem;">
+                        <option value="" disabled selected>— pick —</option>
+                        {% for cat in categories %}
+                          <option value="{{ cat }}">{{ cat }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label style="margin:0;">
+                      <small>Location</small>
+                      <input name="location" required placeholder="e.g. Overste den Oudenlaan 9" style="font-size:.8rem;" />
+                    </label>
+                    <label style="margin:0;">
+                      <small>Day</small>
+                      <select name="day_of_week" required style="font-size:.8rem;">
+                        {% for i, dlabel in days %}
+                          <option value="{{ i }}" {% if i == r.day_of_week %}selected{% endif %}>{{ dlabel }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label style="margin:0;">
+                      <small>Time (HH:MM)</small>
+                      <input type="time" name="time_of_day" required value="{{ r.time_of_day.strftime('%H:%M') }}" style="font-size:.8rem;" />
+                    </label>
+                    <button type="submit" class="small">Add backup</button>
+                  </form>
+                </details>
+              </td>
+            </tr>
           {% endfor %}
         </tbody>
       </table>
