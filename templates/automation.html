@@ -5,12 +5,30 @@
 <section>
   <header class="page-head"><h2>Automation</h2></header>
 
-  <article{% if prefill.name %} class="prefilled"{% endif %}>
+  {% set is_backup_mode = backup_for_rule is not none %}
+  <article{% if prefill.name or is_backup_mode %} class="prefilled"{% endif %}>
     <header>
-      <strong>{% if prefill.name %}New rule (pre-filled){% else %}New rule{% endif %}</strong>
+      <strong>
+        {% if is_backup_mode %}
+          ↦ Add backup for "{{ backup_for_rule.name }}"
+        {% elif prefill.name %}
+          New rule (pre-filled)
+        {% else %}
+          New rule
+        {% endif %}
+      </strong>
+      {% if is_backup_mode %}
+        <a href="/automation" class="secondary outline small" style="float:right;">Cancel</a>
+      {% endif %}
     </header>
-    <p class="muted">Books the next matching class the moment its booking window opens. Then re-arms for the week after.</p>
-    <form method="post" action="/automation" class="rule-form" id="automation-form">
+    {% if is_backup_mode %}
+      <p class="muted">Fires only when the primary fails (class full, terminal error). Backups never run on their own schedule. Day/time default to the primary's — change them if your backup is in a different slot.</p>
+    {% else %}
+      <p class="muted">Books the next matching class the moment its booking window opens. Then re-arms for the week after.</p>
+    {% endif %}
+    <form method="post"
+          action="{% if is_backup_mode %}/automation/{{ backup_for_rule.id }}/add-backup{% else %}/automation{% endif %}"
+          class="rule-form" id="automation-form">
       <label>
         Name
         <input name="name" required value="{{ prefill.name }}" placeholder="e.g. Wednesday Classic CrossFit" />
@@ -40,7 +58,7 @@
       {% set auto_slot = day_time.auto_slot %}
       {% set all_days = day_time.all_days %}
       {% include "_automation_day_time.html" %}
-      <button type="submit">Add rule</button>
+      <button type="submit">{% if is_backup_mode %}Add backup{% else %}Add rule{% endif %}</button>
     </form>
   </article>
 
@@ -108,42 +126,14 @@
                     {% endfor %}
                   </div>
                 {% endif %}
-                <details style="margin-top:.4rem;">
-                  <summary class="muted" style="cursor:pointer;font-size:.8rem;">+ Add backup{% if chain %} (after backup {{ chain|length }}){% endif %}</summary>
-                  <form method="post" action="/automation/{{ r.id }}/add-backup" class="backup-form"
-                        style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.5rem;margin-top:.5rem;align-items:end;">
-                    <label style="margin:0;">
-                      <small>Name</small>
-                      <input name="name" required placeholder="e.g. Mon Aerodance OV" style="font-size:.8rem;" />
-                    </label>
-                    <label style="margin:0;">
-                      <small>Training</small>
-                      <select name="class_category" required style="font-size:.8rem;">
-                        <option value="" disabled selected>— pick —</option>
-                        {% for cat in categories %}
-                          <option value="{{ cat }}">{{ cat }}</option>
-                        {% endfor %}
-                      </select>
-                    </label>
-                    <label style="margin:0;">
-                      <small>Location</small>
-                      <input name="location" required placeholder="e.g. Overste den Oudenlaan 9" style="font-size:.8rem;" />
-                    </label>
-                    <label style="margin:0;">
-                      <small>Day</small>
-                      <select name="day_of_week" required style="font-size:.8rem;">
-                        {% for i, dlabel in days %}
-                          <option value="{{ i }}" {% if i == r.day_of_week %}selected{% endif %}>{{ dlabel }}</option>
-                        {% endfor %}
-                      </select>
-                    </label>
-                    <label style="margin:0;">
-                      <small>Time (HH:MM)</small>
-                      <input type="time" name="time_of_day" required value="{{ r.time_of_day.strftime('%H:%M') }}" style="font-size:.8rem;" />
-                    </label>
-                    <button type="submit" class="small">Add backup</button>
-                  </form>
-                </details>
+                {% if chain|length < 5 %}
+                  <a href="/automation?backup_for={{ r.id }}" class="secondary outline small"
+                     style="margin-top:.4rem;display:inline-block;font-size:.8rem;">
+                    + Add backup{% if chain %} (after backup {{ chain|length }}){% endif %}
+                  </a>
+                {% else %}
+                  <span class="muted" style="font-size:.75rem;">chain at depth cap</span>
+                {% endif %}
               </td>
             </tr>
           {% endfor %}

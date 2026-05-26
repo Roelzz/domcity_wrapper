@@ -101,6 +101,20 @@
                           hx-disabled-elt="this">Book</button>
                 {% endif %}
                 <a class="secondary outline small" href="/automation/from-class/{{ c.id }}" title="Create a recurring automation from this class">⚡ Automate</a>
+                {% if primary_rules %}
+                  <form method="post" action="/automation/from-class/{{ c.id }}/as-backup"
+                        style="display:inline-flex;gap:.2rem;align-items:center;margin:0;"
+                        onsubmit="return this.primary_rule_id.value !== '';">
+                    <select name="primary_rule_id" required
+                            style="font-size:.7rem;padding:.1rem .25rem;max-width:9em;">
+                      <option value="" disabled selected>↦ as backup of…</option>
+                      {% for pr in primary_rules %}
+                        <option value="{{ pr.id }}">{{ pr.name }}</option>
+                      {% endfor %}
+                    </select>
+                    <button class="secondary outline small" title="Add this class as a backup of the selected primary">Set</button>
+                  </form>
+                {% endif %}
               </div>
             </article>
           {% endfor %}
