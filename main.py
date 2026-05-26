@@ -156,6 +156,14 @@ async def schedule_page(
             "classes": sorted(by_day.get(d, []), key=lambda c: c.start),
         })
 
+    # Primary rules (for the "Set as backup of…" dropdown on each class card).
+    with DbSession(engine) as db:
+        primary_rules = db.exec(
+            select(AutomationRule)
+            .where(AutomationRule.backup_only == False)  # noqa: E712
+            .order_by(AutomationRule.day_of_week)
+        ).all()
+
     ctx = {
         "active": "schedule",
         "start": start_d,
@@ -171,6 +179,7 @@ async def schedule_page(
         "window_hints": window_hints,
         "total_count": len(filtered),
         "unfiltered_count": len(all_classes),
+        "primary_rules": primary_rules,
         "error": err,
         "token_warning": _token_warning(),
     }
@@ -368,6 +377,7 @@ async def automation_page(
     prefill_category: str | None = None,
     prefill_day: int | None = None,
     prefill_time: str | None = None,
+    backup_for: int | None = None,
 ):
     with DbSession(engine) as db:
         all_rules = db.exec(
@@ -376,6 +386,9 @@ async def automation_page(
         attempts = db.exec(
             select(BookingAttempt).order_by(BookingAttempt.fired_at.desc()).limit(20)
         ).all()
+        backup_for_rule = db.get(AutomationRule, backup_for) if backup_for else None
+    if backup_for and backup_for_rule is None:
+        raise HTTPException(404, "primary rule not found")
 
     # Top-level list = primary (non-backup_only) rules. Backup-only rules are
     # rendered nested under whichever primary owns them via the chain map.
@@ -409,14 +422,24 @@ async def automation_page(
         fire = _compute_next_fire_from(classes, r, now)
         next_fires[r.id] = fire.isoformat() if fire else "—"
 
+    # In backup mode, default the cascading form's day/time from the primary
+    # rule (the typical case: same-day-same-time backup at a different location
+    # or for a different training). User can still change either selector.
+    effective_prefill_day = prefill_day
+    effective_prefill_time = prefill_time
+    effective_prefill_location = prefill_location
+    if backup_for_rule is not None and prefill_day is None and prefill_time is None:
+        effective_prefill_day = backup_for_rule.day_of_week
+        effective_prefill_time = backup_for_rule.time_of_day.strftime("%H:%M")
+
     # Compute the cascading day/time block from prefill (or empty)
     selected_slot = ""
-    if prefill_location and prefill_time:
-        selected_slot = f"{prefill_location}{SLOT_SEPARATOR}{prefill_time}"
+    if effective_prefill_location and effective_prefill_time:
+        selected_slot = f"{effective_prefill_location}{SLOT_SEPARATOR}{effective_prefill_time}"
     day_time_ctx = _build_day_time_ctx(
         classes,
         category=prefill_category or "",
-        dow=prefill_day if prefill_day is not None else None,
+        dow=effective_prefill_day if effective_prefill_day is not None else None,
         selected_slot=selected_slot,
     )
 
@@ -433,6 +456,7 @@ async def automation_page(
             "name": prefill_name or "",
             "category": prefill_category or "",
         },
+        "backup_for_rule": backup_for_rule,
         "token_warning": _token_warning(),
     }
     return templates.TemplateResponse(request, "automation.html", ctx)
@@ -677,54 +701,101 @@ async def automation_fire(rule_id: int):
     return RedirectResponse("/automation", status_code=303)
 
 
+def _attach_backup_to_chain_tail(
+    db, primary_id: int, new_rule: AutomationRule
+) -> None:
+    """Walk the existing chain from `primary_id` and attach `new_rule` (already
+    persisted with an id) to the tail. Enforces MAX_CHAIN_DEPTH; raises 400 if
+    the chain is already full. Caller commits."""
+    primary = db.get(AutomationRule, primary_id)
+    if not primary:
+        raise HTTPException(404)
+    tail = primary
+    depth = 1
+    visited = {primary.id}
+    while tail.backup_rule_id is not None:
+        if depth >= scheduler.MAX_CHAIN_DEPTH:
+            raise HTTPException(400, "chain already at depth cap")
+        nxt = db.get(AutomationRule, tail.backup_rule_id)
+        if nxt is None or nxt.id in visited:
+            break
+        visited.add(nxt.id)
+        tail = nxt
+        depth += 1
+    tail.backup_rule_id = new_rule.id
+    db.add(tail)
+
+
 @app.post("/automation/{rule_id}/add-backup")
 async def automation_add_backup(
     rule_id: int,
     name: str = Form(...),
     class_category: str = Form(...),
-    location: str = Form(...),
     day_of_week: int = Form(...),
-    time_of_day: str = Form(...),  # "HH:MM"
+    time_of_day: str = Form(...),  # "Location|HH:MM" (same as automation_create)
 ):
     """Create a new backup_only rule and attach it to the tail of this rule's
-    existing backup chain. Grows the chain progressively without forcing the
-    user to think about ordering — each click appends one more fallback link."""
+    existing backup chain. Uses the same packed Location|HH:MM contract as
+    automation_create so the cascading HTMX picker can submit to either."""
     try:
-        hh, mm = (int(x) for x in time_of_day.split(":")[:2])
+        location, hhmm = time_of_day.split(SLOT_SEPARATOR, 1)
+        hh, mm = (int(x) for x in hhmm.split(":")[:2])
     except (ValueError, AttributeError) as e:
-        raise HTTPException(400, f"Bad time: {e}") from e
+        raise HTTPException(400, f"Bad time slot: {e}") from e
 
+    new_rule = AutomationRule(
+        name=name.strip() or f"{DAYS_LONG[day_of_week]} {class_category}",
+        location=location.strip(),
+        class_category=class_category.strip(),
+        day_of_week=day_of_week,
+        time_of_day=time(hour=hh, minute=mm),
+        enabled=True,
+        backup_only=True,
+    )
     with DbSession(engine) as db:
-        primary = db.get(AutomationRule, rule_id)
-        if not primary:
-            raise HTTPException(404)
-        # Walk to the tail of the existing chain so we attach to the last link.
-        tail = primary
-        depth = 1
-        visited = {primary.id}
-        while tail.backup_rule_id is not None:
-            if depth >= scheduler.MAX_CHAIN_DEPTH:
-                raise HTTPException(400, "chain already at depth cap")
-            nxt = db.get(AutomationRule, tail.backup_rule_id)
-            if nxt is None or nxt.id in visited:
-                break
-            visited.add(nxt.id)
-            tail = nxt
-            depth += 1
-
-        new_rule = AutomationRule(
-            name=name.strip() or f"{DAYS_LONG[day_of_week]} {class_category}",
-            location=location.strip(),
-            class_category=class_category.strip(),
-            day_of_week=day_of_week,
-            time_of_day=time(hour=hh, minute=mm),
-            enabled=True,
-            backup_only=True,
-        )
         db.add(new_rule)
-        db.flush()  # get new_rule.id
-        tail.backup_rule_id = new_rule.id
-        db.add(tail)
+        db.flush()  # populate new_rule.id
+        _attach_backup_to_chain_tail(db, rule_id, new_rule)
+        db.commit()
+
+    await scheduler.reschedule_all()
+    return RedirectResponse("/automation", status_code=303)
+
+
+@app.post("/automation/from-class/{slot_id}/as-backup")
+async def automation_from_class_as_backup(
+    slot_id: str,
+    primary_rule_id: int = Form(...),
+):
+    """Make this specific class a backup of the selected primary rule. Looks
+    up the slot in PushPress, creates a backup_only AutomationRule with the
+    slot's location/category/day/time, attaches to the primary's chain tail."""
+    if not (settings.pushpress_email and settings.pushpress_password):
+        raise HTTPException(503, "PushPress credentials not configured")
+    today = datetime.now().date()
+    classes = await pushpress.list_schedule(
+        today - timedelta(days=today.weekday()), today + timedelta(days=14)
+    )
+    slot = next((c for c in classes if c.id == slot_id), None)
+    if not slot:
+        raise HTTPException(404, "class not found in upcoming schedule")
+    local = slot.start.astimezone(scheduler.tz())
+    suggested_name = f"{DAYS_LONG[local.weekday()]} {slot.category}"
+    if slot.location_code:
+        suggested_name += f" {slot.location_code}"
+    new_rule = AutomationRule(
+        name=suggested_name,
+        location=slot.location,
+        class_category=slot.category,
+        day_of_week=local.weekday(),
+        time_of_day=time(hour=local.hour, minute=local.minute),
+        enabled=True,
+        backup_only=True,
+    )
+    with DbSession(engine) as db:
+        db.add(new_rule)
+        db.flush()
+        _attach_backup_to_chain_tail(db, primary_rule_id, new_rule)
         db.commit()
 
     await scheduler.reschedule_all()

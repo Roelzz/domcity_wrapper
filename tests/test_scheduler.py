@@ -688,3 +688,131 @@ def test_manual_fire_endpoint_no_slot_returns_400(monkeypatch):
 
     assert r.status_code == 400
     assert "no matching class" in r.text.lower()
+
+
+def test_automation_backup_for_mode_renders_cascading_form(monkeypatch):
+    """GET /automation?backup_for=<id> must pivot the create form into backup
+    mode: heading mentions the primary's name and form action points at
+    /automation/<id>/add-backup."""
+    from fastapi.testclient import TestClient
+
+    import main
+    from auth import COOKIE_NAME, make_session_token
+    from models import Session as ModelsSession
+    from models import engine
+
+    with TestClient(main.app) as client:
+        with ModelsSession(engine) as db:
+            rule = AutomationRule(
+                name="My Primary", location="OV",
+                class_category="Classic CrossFit",
+                day_of_week=2, time_of_day=time(18, 30), enabled=True,
+            )
+            db.add(rule)
+            db.commit()
+            db.refresh(rule)
+            rule_id = rule.id
+
+        client.cookies.set(COOKIE_NAME, make_session_token())
+        r = client.get(f"/automation?backup_for={rule_id}")
+
+        with ModelsSession(engine) as db:
+            leftover = db.get(AutomationRule, rule_id)
+            if leftover:
+                db.delete(leftover)
+                db.commit()
+
+    assert r.status_code == 200
+    body = r.text
+    assert "Add backup for" in body
+    assert "My Primary" in body
+    assert f'action="/automation/{rule_id}/add-backup"' in body
+
+
+def test_automation_backup_for_nonexistent_returns_404():
+    from fastapi.testclient import TestClient
+
+    import main
+    from auth import COOKIE_NAME, make_session_token
+
+    with TestClient(main.app) as client:
+        client.cookies.set(COOKIE_NAME, make_session_token())
+        r = client.get("/automation?backup_for=999999")
+    assert r.status_code == 404
+
+
+def test_from_class_as_backup_attaches_to_chain_tail(monkeypatch):
+    """POST /automation/from-class/{slot_id}/as-backup looks up the slot,
+    creates a backup_only rule with its params, and attaches to the primary's
+    chain tail."""
+    from fastapi.testclient import TestClient
+
+    import main
+    import pushpress
+    from auth import COOKIE_NAME, make_session_token
+    from models import Session as ModelsSession
+    from models import engine
+
+    # Force the "creds set" branch — the endpoint short-circuits when blank.
+    monkeypatch.setattr(main.settings, "pushpress_email", "x@example.com")
+    monkeypatch.setattr(main.settings, "pushpress_password", "pw")
+
+    target_slot = _ov_slot(
+        "cal-newbackup", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5
+    )
+
+    async def fake_list_schedule(start, end):
+        return [target_slot]
+    monkeypatch.setattr(pushpress, "list_schedule", fake_list_schedule)
+
+    async def noop_reschedule():
+        return None
+    monkeypatch.setattr(main.scheduler, "reschedule_all", noop_reschedule)
+
+    with TestClient(main.app) as client:
+        with ModelsSession(engine) as db:
+            primary = AutomationRule(
+                name="Wed Classic OV", location="Overste den Oudenlaan 9",
+                class_category="Classic CrossFit",
+                day_of_week=2, time_of_day=time(18, 30), enabled=True,
+            )
+            db.add(primary)
+            db.commit()
+            db.refresh(primary)
+            primary_id = primary.id
+
+        client.cookies.set(COOKIE_NAME, make_session_token())
+        r = client.post(
+            f"/automation/from-class/{target_slot.id}/as-backup",
+            data={"primary_rule_id": str(primary_id)},
+            follow_redirects=False,
+        )
+
+        # The created backup rule should be linked to the primary.
+        with ModelsSession(engine) as db:
+            primary_after = db.get(AutomationRule, primary_id)
+            assert primary_after.backup_rule_id is not None
+            backup = db.get(AutomationRule, primary_after.backup_rule_id)
+            assert backup is not None
+            assert backup.backup_only is True
+            assert backup.class_category == "Classic CrossFit"
+            assert backup.location == "Overste den Oudenlaan 9"
+            assert backup.day_of_week == 2
+            assert backup.time_of_day == time(18, 30)
+            backup_id = backup.id
+
+        # Cleanup
+        with ModelsSession(engine) as db:
+            for rid in (primary_id, backup_id):
+                rr = db.get(AutomationRule, rid)
+                if rr:
+                    rr.backup_rule_id = None
+                    db.add(rr)
+            db.commit()
+            for rid in (primary_id, backup_id):
+                rr = db.get(AutomationRule, rid)
+                if rr:
+                    db.delete(rr)
+            db.commit()
+
+    assert r.status_code == 303
