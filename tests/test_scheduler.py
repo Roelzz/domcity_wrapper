@@ -328,3 +328,363 @@ class _FakeDb:
 
     def get(self, _model, _rule_id):
         return self._rule
+
+
+class _MultiFakeDb:
+    """Fake Session that knows about multiple rules by id. Used by chain tests
+    that need DbSession(engine).get() to return different rules across calls."""
+    def __init__(self, rules_by_id: dict[int, AutomationRule]):
+        self._rules = rules_by_id
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def get(self, _model, rule_id):
+        return self._rules.get(rule_id)
+
+
+def _backup_rule(rule_id: int, **overrides) -> AutomationRule:
+    """A primary-by-default AutomationRule with a controllable id."""
+    base = dict(
+        id=rule_id,
+        name=f"Rule {rule_id}",
+        location="Overste den Oudenlaan 9",
+        class_category="Classic CrossFit",
+        day_of_week=2,
+        time_of_day=time(18, 30),
+        enabled=True,
+        backup_only=False,
+        backup_rule_id=None,
+    )
+    base.update(overrides)
+    return AutomationRule(**base)
+
+
+# ---- Backup chain tests ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_class_full_at_window_open_chains_to_backup_when_set(
+    monkeypatch, reset_loop_guard
+):
+    """Primary's class is full at window-open AND it has a backup configured:
+    polling MUST be skipped and the backup chain MUST fire immediately."""
+    primary = _backup_rule(1, backup_rule_id=2)
+    backup = _backup_rule(2, name="Backup A", class_category="Aerodance", backup_only=True)
+    primary_slot = _ov_slot("cal-primary", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=0)
+    backup_slot = _ov_slot("cal-backup", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5)
+
+    monkeypatch.setattr(scheduler, "DbSession",
+                        lambda *_a, **_k: _MultiFakeDb({1: primary, 2: backup}))
+    async def fake_lookup(uuid):
+        return primary_slot if uuid == "cal-primary" else backup_slot
+    monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
+    async def fake_find_next(rule, after=None):
+        if rule.id == 2:
+            return backup_slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+        return None, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    polling_started = []
+    async def fake_start_polling(*a, **k):
+        polling_started.append((a, k))
+    monkeypatch.setattr(scheduler, "_start_polling", fake_start_polling)
+
+    book_calls = []
+    async def fake_book(uuid):
+        from pushpress import BookingResult
+        book_calls.append(uuid)
+        return BookingResult(ok=True, reservation_id="r", message="booked")
+    monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
+
+    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "reminder_scan_job", _async_noop)
+    monkeypatch.setattr(scheduler, "_schedule_after", _async_noop)
+    monkeypatch.setattr(scheduler, "_advance_past_slot", _async_noop)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler.booking_window_job(1, 0, "cal-primary")
+
+    assert polling_started == [], (
+        "polling must be skipped when a backup_rule_id is set on the primary"
+    )
+    assert book_calls == ["cal-backup"], (
+        "backup's class should have been booked via the chain"
+    )
+
+
+@pytest.mark.asyncio
+async def test_class_full_at_window_open_polls_when_no_backup(
+    monkeypatch, reset_loop_guard
+):
+    """Regression: when NO backup is set, the class-full branch must still
+    fall through to _start_polling (existing behavior preserved)."""
+    primary = _backup_rule(1)  # no backup_rule_id
+    slot = _ov_slot("cal-full", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=0)
+
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _FakeDb(primary))
+    async def fake_lookup(uuid):
+        return slot
+    monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
+
+    polling_started = []
+    async def fake_start_polling(*a, **k):
+        polling_started.append(True)
+    monkeypatch.setattr(scheduler, "_start_polling", fake_start_polling)
+
+    book_calls = []
+    async def fake_book(uuid):
+        from pushpress import BookingResult
+        book_calls.append(uuid)
+        return BookingResult(ok=True, reservation_id="r", message="booked")
+    monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
+
+    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler.booking_window_job(1, 0, "cal-full")
+
+    assert polling_started == [True], "no backup configured ⇒ poll, do not chain"
+    assert book_calls == []
+
+
+@pytest.mark.asyncio
+async def test_chain_recurses_when_backup_has_no_slot(monkeypatch):
+    """A → B (no slot) → C (has slot) — the chain must skip B and fire C."""
+    a = _backup_rule(1, backup_rule_id=2)
+    b = _backup_rule(2, name="B", backup_rule_id=3, backup_only=True)
+    c = _backup_rule(3, name="C", backup_only=True)
+    c_slot = _ov_slot("cal-c", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5)
+
+    monkeypatch.setattr(scheduler, "DbSession",
+                        lambda *_a, **_k: _MultiFakeDb({1: a, 2: b, 3: c}))
+
+    async def fake_find_next(rule, after=None):
+        if rule.id == 3:
+            return c_slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+        return None, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    booking_calls = []
+    async def fake_bwj(rule_id, attempt, uuid, **kwargs):
+        booking_calls.append((rule_id, uuid, kwargs.get("chained_from")))
+    monkeypatch.setattr(scheduler, "booking_window_job", fake_bwj)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+
+    fired = await scheduler._chain_to_backup(
+        a, datetime(2026, 6, 3, 18, 30, tzinfo=TZ), {a.id}, "test"
+    )
+
+    assert fired is True
+    assert len(booking_calls) == 1
+    fired_id, fired_uuid, chained_from = booking_calls[0]
+    assert fired_id == 3
+    assert fired_uuid == "cal-c"
+    assert chained_from == {1, 2}  # both A and B in visited
+
+
+@pytest.mark.asyncio
+async def test_chain_cycle_detection_breaks_loop(monkeypatch):
+    """If the chain would loop back (A → B → A), the second link must be
+    rejected — not fired and not infinitely recursed."""
+    a = _backup_rule(1, backup_rule_id=2)
+    b = _backup_rule(2, name="B", backup_rule_id=1, backup_only=True)
+    b_slot = _ov_slot("cal-b", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5)
+
+    monkeypatch.setattr(scheduler, "DbSession",
+                        lambda *_a, **_k: _MultiFakeDb({1: a, 2: b}))
+
+    async def fake_find_next(rule, after=None):
+        if rule.id == 2:
+            return b_slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+        return None, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    booking_calls = []
+    async def fake_bwj(rule_id, attempt, uuid, **kwargs):
+        booking_calls.append(rule_id)
+    monkeypatch.setattr(scheduler, "booking_window_job", fake_bwj)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+
+    # Start at A. Chain follows to B and fires it. B's chain points back to A
+    # — but at that point A is already visited, so _chain_to_backup(B,...)
+    # returns False instead of looping.
+    fired = await scheduler._chain_to_backup(
+        a, datetime(2026, 6, 3, 18, 30, tzinfo=TZ), {a.id}, "test"
+    )
+    assert fired is True
+    assert booking_calls == [2]
+
+    # Now call from B's perspective with A already visited — must NOT fire A.
+    booking_calls.clear()
+    fired2 = await scheduler._chain_to_backup(
+        b, datetime(2026, 6, 3, 18, 30, tzinfo=TZ), {a.id, b.id}, "test"
+    )
+    assert fired2 is False
+    assert booking_calls == []
+
+
+@pytest.mark.asyncio
+async def test_chain_depth_cap_enforced(monkeypatch):
+    """Past MAX_CHAIN_DEPTH the chain stops, even if more backups exist."""
+    # Build a chain longer than MAX_CHAIN_DEPTH.
+    rules = {}
+    for i in range(1, scheduler.MAX_CHAIN_DEPTH + 3):
+        rules[i] = _backup_rule(
+            i, name=f"R{i}",
+            backup_rule_id=(i + 1) if i < scheduler.MAX_CHAIN_DEPTH + 2 else None,
+        )
+    last_slot = _ov_slot("cal-last", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _MultiFakeDb(rules))
+
+    async def fake_find_next(rule, after=None):
+        # Only the very last rule has a slot — chain has to walk through all.
+        if rule.id == scheduler.MAX_CHAIN_DEPTH + 2:
+            return last_slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+        return None, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    booking_calls = []
+    async def fake_bwj(rule_id, attempt, uuid, **kwargs):
+        booking_calls.append(rule_id)
+    monkeypatch.setattr(scheduler, "booking_window_job", fake_bwj)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+
+    visited = {1}
+    fired = await scheduler._chain_to_backup(
+        rules[1], datetime(2026, 6, 3, 18, 30, tzinfo=TZ), visited, "test"
+    )
+    assert fired is False, "depth cap must short-circuit the chain"
+    assert booking_calls == []
+
+
+@pytest.mark.asyncio
+async def test_handle_failure_class_full_chains_when_backup_set(
+    monkeypatch, reset_loop_guard
+):
+    """Class-full mid-flow (book call returned a class-full message) AND a
+    backup is configured → must chain, NOT start polling."""
+    primary = _backup_rule(1, backup_rule_id=2)
+    backup = _backup_rule(2, backup_only=True)
+    primary_slot = _ov_slot("cal-p", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=2)
+    backup_slot = _ov_slot("cal-b", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5)
+
+    monkeypatch.setattr(scheduler, "DbSession",
+                        lambda *_a, **_k: _MultiFakeDb({1: primary, 2: backup}))
+    async def fake_find_next(rule, after=None):
+        return backup_slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    polled = []
+    async def fake_start_polling(*a, **k):
+        polled.append(True)
+    monkeypatch.setattr(scheduler, "_start_polling", fake_start_polling)
+
+    chain_calls = []
+    async def fake_bwj(rule_id, attempt, uuid, **kwargs):
+        chain_calls.append((rule_id, uuid))
+    monkeypatch.setattr(scheduler, "booking_window_job", fake_bwj)
+
+    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+    monkeypatch.setattr(scheduler, "_advance_past_slot", _async_noop)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    await scheduler._handle_failure(
+        primary, attempt=0, label="x",
+        msg="class is full, no spots", slot=primary_slot,
+    )
+
+    assert polled == [], "primary with backup must skip polling"
+    assert chain_calls == [(2, "cal-b")], "backup should have fired via the chain"
+
+
+# ---- Manual fire endpoint integration ------------------------------------
+
+
+def test_manual_fire_endpoint_resolves_slot_and_fires(monkeypatch):
+    """Regression: the bug was that POST /automation/{id}/fire called
+    booking_window_job(rule_id, 0) without calendar_item_uuid, raising
+    TypeError. The fix resolves the next matching slot first."""
+    from fastapi.testclient import TestClient
+
+    import main
+    from auth import COOKIE_NAME, make_session_token
+    from models import Session as ModelsSession
+    from models import engine
+
+    slot = _ov_slot("cal-manual", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+    async def fake_find_next(_rule, after=None):
+        return slot, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    bwj_calls = []
+    async def fake_bwj(rid, attempt, uuid, **kwargs):
+        bwj_calls.append((rid, attempt, uuid, kwargs))
+    monkeypatch.setattr(scheduler, "booking_window_job", fake_bwj)
+
+    with TestClient(main.app) as client:
+        # init_db() ran in the lifespan; safe to insert now.
+        with ModelsSession(engine) as db:
+            rule = AutomationRule(
+                name="Test", location="OV", class_category="Classic CrossFit",
+                day_of_week=2, time_of_day=time(18, 30), enabled=True,
+            )
+            db.add(rule)
+            db.commit()
+            db.refresh(rule)
+            rule_id = rule.id
+
+        client.cookies.set(COOKIE_NAME, make_session_token())
+        r = client.post(f"/automation/{rule_id}/fire", follow_redirects=False)
+
+        with ModelsSession(engine) as db:
+            leftover = db.get(AutomationRule, rule_id)
+            if leftover:
+                db.delete(leftover)
+                db.commit()
+
+    assert r.status_code == 303
+    assert bwj_calls == [(rule_id, 0, "cal-manual", {"manual": True})]
+
+
+def test_manual_fire_endpoint_no_slot_returns_400(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import main
+    from auth import COOKIE_NAME, make_session_token
+    from models import Session as ModelsSession
+    from models import engine
+
+    async def fake_find_next(_rule, after=None):
+        return None, datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+    monkeypatch.setattr(scheduler, "find_next_matching_slot", fake_find_next)
+
+    with TestClient(main.app) as client:
+        with ModelsSession(engine) as db:
+            rule = AutomationRule(
+                name="Empty", location="OV", class_category="Classic CrossFit",
+                day_of_week=2, time_of_day=time(18, 30), enabled=True,
+            )
+            db.add(rule)
+            db.commit()
+            db.refresh(rule)
+            rule_id = rule.id
+
+        client.cookies.set(COOKIE_NAME, make_session_token())
+        r = client.post(f"/automation/{rule_id}/fire", follow_redirects=False)
+
+        with ModelsSession(engine) as db:
+            leftover = db.get(AutomationRule, rule_id)
+            if leftover:
+                db.delete(leftover)
+                db.commit()
+
+    assert r.status_code == 400
+    assert "no matching class" in r.text.lower()
