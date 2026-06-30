@@ -7,7 +7,19 @@ from settings import settings
 
 COOKIE_NAME = "domcity_session"
 SESSION_VALUE = "ok"
-PUBLIC_PATHS = ("/login", "/static", "/healthz", "/favicon.ico", "/calendar.ics")
+# /mcp (MCP protocol + OAuth operational routes) and /.well-known (OAuth
+# discovery) must bypass the browser cookie gate — the MCP endpoint is
+# protected by its own OAuth, and Claude needs an unauthenticated 401 +
+# discovery handshake, not a 303 redirect to the web login.
+PUBLIC_PATHS = (
+    "/login",
+    "/static",
+    "/healthz",
+    "/favicon.ico",
+    "/calendar.ics",
+    "/mcp",
+    "/.well-known",
+)
 
 _serializer = URLSafeSerializer(settings.secret_key, salt="domcity-auth")
 

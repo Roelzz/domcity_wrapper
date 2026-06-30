@@ -13,14 +13,27 @@ def test_unauth_redirects_to_login():
 
 def test_login_wrong_password():
     with TestClient(main.app) as client:
-        r = client.post("/login", data={"password": "nope"}, follow_redirects=False)
+        r = client.post(
+            "/login", data={"username": "admin", "password": "nope"}, follow_redirects=False
+        )
         assert r.status_code == 303
         assert "/login?error=1" in r.headers["location"]
 
 
-def test_login_right_password_sets_cookie():
+def test_login_wrong_username():
     with TestClient(main.app) as client:
-        r = client.post("/login", data={"password": "test-pw"}, follow_redirects=False)
+        r = client.post(
+            "/login", data={"username": "nope", "password": "test-pw"}, follow_redirects=False
+        )
+        assert r.status_code == 303
+        assert "/login?error=1" in r.headers["location"]
+
+
+def test_login_right_credentials_sets_cookie():
+    with TestClient(main.app) as client:
+        r = client.post(
+            "/login", data={"username": "admin", "password": "test-pw"}, follow_redirects=False
+        )
         assert r.status_code == 303
         assert COOKIE_NAME in r.cookies
 
