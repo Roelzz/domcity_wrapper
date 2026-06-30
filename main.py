@@ -15,6 +15,7 @@ from sqlmodel import select
 import pushpress
 import scheduler
 from auth import COOKIE_NAME, AuthMiddleware, make_session_token
+from mcp_server import mcp, provider
 from models import AutomationRule, BookingAttempt, engine, init_db
 from settings import settings
 
@@ -29,21 +30,27 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DAYS_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 SLOT_SEPARATOR = "|"
 
+# Streamable-HTTP ASGI app for the MCP server. Built with path="/" and mounted
+# at "/mcp" below, so the externally reachable endpoint is <mcp_base_url>/mcp.
+# Its lifespan (which boots the MCP session manager) MUST be chained into ours.
+mcp_app = mcp.http_app(path="/")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    scheduler.start()
-    await _prime_token()
-    await scheduler.horizon_refresh_all()
-    scheduler.schedule_token_refresh()
-    scheduler.schedule_reminder_scan()
-    scheduler.schedule_daily_digest()
-    scheduler.schedule_horizon_refresh()
-    logger.info("Domcity Planner up on port {}", settings.port)
-    yield
-    scheduler.shutdown()
-    await pushpress.aclose()
+    async with mcp_app.lifespan(app):
+        init_db()
+        scheduler.start()
+        await _prime_token()
+        await scheduler.horizon_refresh_all()
+        scheduler.schedule_token_refresh()
+        scheduler.schedule_reminder_scan()
+        scheduler.schedule_daily_digest()
+        scheduler.schedule_horizon_refresh()
+        logger.info("Domcity Planner up on port {}", settings.port)
+        yield
+        scheduler.shutdown()
+        await pushpress.aclose()
 
 
 async def _prime_token() -> None:
@@ -66,6 +73,11 @@ BASE = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 templates = Jinja2Templates(directory=BASE / "templates")
 
+# OAuth discovery metadata for the MCP server must live at the domain root
+# (RFC 8414 / 9728), while the operational + protocol routes live under /mcp.
+app.router.routes.extend(provider.get_well_known_routes(mcp_path="/"))
+app.mount("/mcp", mcp_app)
+
 
 # ---------- Health ----------
 @app.get("/healthz")
@@ -80,8 +92,8 @@ async def login_page(request: Request, error: str | None = None):
 
 
 @app.post("/login")
-async def login_submit(password: str = Form(...)):
-    if password != settings.app_password:
+async def login_submit(username: str = Form(...), password: str = Form(...)):
+    if username != settings.app_username or password != settings.app_password:
         return RedirectResponse("/login?error=1", status_code=303)
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie(

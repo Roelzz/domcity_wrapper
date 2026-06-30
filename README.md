@@ -14,6 +14,7 @@ Built for one gym member ("Dom city" = Utrecht), deployed on a home server via C
 - **Telegram reminders** — two pings per booked class: 📅 same-day at 08:00 local, ⏰ 30 minutes before class start. Includes location + instructor. Plus success/failure messages on every automation attempt.
 - **iCal feed** — `/calendar.ics?token=…` returns your active reservations as a subscribable calendar. Drop the URL into Apple Calendar / Google / Fastmail.
 - **/stats** — bookings dashboard: success rate, weekly timeline, per-rule and per-category breakdown.
+- **MCP server** — use the gym from **Claude** (Desktop + phone). Read your schedule and book/cancel/automate by chatting, via an `/mcp` endpoint protected by a self-hosted OAuth login. See [MCP server (Claude)](#mcp-server-claude).
 
 ## Stack
 
@@ -21,6 +22,7 @@ Built for one gym member ("Dom city" = Utrecht), deployed on a home server via C
 - FastAPI + Jinja2 + HTMX + Pico.css (no JS build step)
 - httpx async client → PushPress GraphQL API (`api.pushpress.com/v2/graph/graphql`)
 - APScheduler `AsyncIOScheduler` (in-process cron) · SQLModel + SQLite · loguru
+- FastMCP (Streamable HTTP MCP server at `/mcp`) + self-hosted OAuth 2.1 for Claude Desktop/mobile
 - 60-second in-memory cache + parallel `asyncio.gather` for sub-20ms warm page loads
 
 ## How auth works
@@ -49,11 +51,13 @@ If you fork this for a gym in a different city, **set `TZ` in `.env`** to that g
 uv sync
 cp .env.example .env
 # Edit .env:
-#   APP_PASSWORD       — your chosen password to unlock the UI
+#   APP_USERNAME       — username to unlock the UI + MCP (default: admin)
+#   APP_PASSWORD       — your chosen password to unlock the UI + MCP
 #   SECRET_KEY         — python -c "import secrets; print(secrets.token_urlsafe(32))"
 #   PUSHPRESS_EMAIL    — your members.pushpress.com email
 #   PUSHPRESS_PASSWORD — your members.pushpress.com password
 #   TZ                 — gym's local zone, e.g. Europe/Amsterdam
+#   MCP_BASE_URL       — public HTTPS origin for the MCP server (prod only)
 #   TELEGRAM_BOT_TOKEN — optional, for booking & reminder notifications
 #   TELEGRAM_CHAT_ID   — optional
 
@@ -71,6 +75,38 @@ Open <http://localhost:2009> → enter `APP_PASSWORD` → schedule loads.
 3. `curl https://api.telegram.org/bot<TOKEN>/getUpdates` — find `"chat":{"id":<number>}` in the JSON. That number is `TELEGRAM_CHAT_ID`.
 4. Paste both into `.env`, restart the app.
 
+## MCP server (Claude)
+
+The app exposes itself as an **MCP server** at `/mcp`, so Claude can read your schedule and book classes for you — both from **Claude Desktop** on your laptop and from **Claude on your phone** (the iOS/Android app and claude.ai web). One deployed endpoint serves both.
+
+### Tools
+
+Read: `get_schedule`, `get_reservations`, `get_stats`, `get_tenant_info`, `list_automation_rules`.
+Write (real side effects on your gym account): `book_class`, `cancel_reservation`, `create_automation_rule`, `toggle_automation_rule`, `pause_automation_rule`, `delete_automation_rule`, `fire_automation_rule`.
+
+Because MCP runs **in the same process** as the web app, it shares the live APScheduler, SQLite DB, and cached PushPress token — so a rule created by Claude is armed by the scheduler exactly like one created in the web UI.
+
+### Auth
+
+The MCP endpoint is protected by a **self-hosted OAuth 2.1 server** built into the app (Claude's mobile/web custom connector rejects static bearer tokens — OAuth is mandatory). The OAuth login screen validates the **same `APP_USERNAME` + `APP_PASSWORD`** from `.env` that gates the web UI. No third-party IdP, no extra accounts. Claude registers itself automatically (Dynamic Client Registration); you just log in once.
+
+> OAuth client/token state is in-memory — on a server restart Claude transparently re-registers and asks you to log in again. No DB schema change, no infra change.
+
+### Connect from Claude (Desktop + phone)
+
+1. Deploy behind HTTPS (Coolify gives you TLS) and set `MCP_BASE_URL` to your **exact public origin**, e.g. `https://domcity.example.com`. This must match the domain Claude connects to or OAuth discovery/redirect validation fails.
+2. In Claude → **Settings → Connectors → Add custom connector**.
+3. URL: `https://<your-domain>/mcp`
+4. Claude opens the login screen → enter your `APP_USERNAME` + `APP_PASSWORD` → done. The same connector now works on the phone app and claude.ai.
+
+### Local dev
+
+```bash
+uv run uvicorn main:app --port 2009
+```
+
+MCP is then at `http://localhost:2009/mcp`. Claude Desktop can use a local HTTP MCP endpoint directly; the phone/web connector needs the public HTTPS URL above. `MCP_BASE_URL` defaults to `http://localhost:2009` for local use.
+
 ## Tests
 
 ```bash
@@ -78,7 +114,9 @@ uv run ruff check .
 uv run pytest
 ```
 
-30 tests cover title parsing, scheduler timing + matching, route auth + filters, GraphQL client (mocked via respx), login flow.
+Tests cover title parsing, scheduler timing + matching, route auth + filters, GraphQL client (mocked via respx), login flow, the MCP tool wrappers (via FastMCP's in-memory client), and the self-hosted OAuth credential gate + PKCE code round-trip.
+
+
 
 ## Deploy (Coolify + Nixpacks)
 
@@ -98,7 +136,9 @@ Without step 4, your `TokenCache` + automation rules + booking history get wiped
 
 ```
 Domcity/
-├── main.py                                # FastAPI app, routes, lifespan
+├── main.py                                # FastAPI app, routes, lifespan, /mcp mount
+├── mcp_server.py                          # FastMCP server + tools (schedule, book, automation)
+├── mcp_oauth.py                           # Self-hosted OAuth 2.1 provider (.env credential gate)
 ├── pushpress.py                           # GraphQL client + auto-refresh
 ├── scheduler.py                           # APScheduler + booking + reminders + token refresh
 ├── auth.py                                # App-password gate, signed cookie middleware
@@ -116,7 +156,7 @@ Domcity/
 │   ├── _automation_day_time.html          # HTMX partial: cascading Day + Time-slot
 │   └── _time_slot_select.html             # legacy partial (kept for compat shim)
 ├── static/app.css                         # Chip styles, day-grid, responsive, dark mode
-├── tests/                                 # 30 tests, all green
+├── tests/                                 # title parsing, scheduler, routes, MCP tools, OAuth
 ├── docs/                                  # gitignored HARs (endpoint reference)
 ├── LICENSE                                # MIT
 ├── nixpacks.toml

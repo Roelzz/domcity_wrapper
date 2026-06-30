@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "loguru>=0.7",
     "python-multipart>=0.0.20",
+    "fastmcp>=3.4.2",
 ]
 
 [dependency-groups]
