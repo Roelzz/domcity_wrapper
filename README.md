@@ -122,7 +122,7 @@ Tests cover title parsing, scheduler timing + matching, route auth + filters, Gr
 
 1. Push this repo to GitHub.
 2. New Coolify app → Source = your repo → Build pack = **Nixpacks** (auto-detects via `nixpacks.toml`). `uv.lock` is committed so `uv sync --frozen` works at build time.
-3. **Environment Variables**: copy from `.env.example`, fill in real values.
+3. **Environment Variables**: copy from `.env.example`, fill in real values. **Set `MCP_BASE_URL` to your exact public HTTPS origin** (e.g. `https://domcity.example.com`, no trailing slash) — not the `http://localhost:2009` default. If you leave the default, Claude's OAuth discovery advertises `localhost` URLs it can't reach and the connector fails with `invalid_token`.
 4. **Persistent Storage** → **+ Add** → **Volume Mount**:
    - Name: `domcity-data`
    - Source path: *(leave empty)*

@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from loguru import logger
 from sqlmodel import Session as DbSession
 from sqlmodel import select
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import pushpress
 import scheduler
@@ -68,6 +69,11 @@ async def _prime_token() -> None:
 
 app = FastAPI(title="Domcity Planner", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
+# Outermost: trust the reverse proxy (Coolify/Traefik) X-Forwarded-* headers so
+# the app sees the real https scheme. Without this, uvicorn only trusts
+# 127.0.0.1 and treats proxied requests as http, which downgrades the OAuth
+# discovery/redirect URLs to http and breaks the Claude connector handshake.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 BASE = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
