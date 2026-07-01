@@ -77,6 +77,29 @@ class BookingResult(BaseModel):
     message: str = ""
 
 
+class SubscriptionUsage(BaseModel):
+    """Session/credit balance for one subscription in the current billing period.
+
+    PushPress caps how many sessions a plan may book per period. ``reservations``
+    are upcoming (future) bookings already held, ``checkins`` are sessions already
+    attended this period; ``used`` is their sum and ``remaining`` is
+    ``limit - used`` (clamped at 0). ``remaining`` is ``None`` when the plan has no
+    limit (unlimited) or PushPress does not report one.
+    """
+
+    subscription_uuid: str
+    plan: str = ""
+    status: str = ""
+    limit: int | None = None
+    reservations: int = 0
+    checkins: int = 0
+    used: int = 0
+    remaining: int | None = None
+    period: str = ""
+    period_start: str = ""
+    period_end: str = ""
+
+
 # -------- JWT + token lifecycle ----------------------------------------------
 
 
@@ -313,6 +336,12 @@ _RESERVATIONS_TTL_SEC = 15
 _reservations_cache: tuple[float, list[Reservation]] | None = None
 _reservations_lock = asyncio.Lock()
 
+# Subscription session-usage cache. Values shift only on book/cancel/checkin, so
+# a short TTL is plenty; this is advisory credit info, not a booking gate.
+_SUBSCRIPTION_USAGE_TTL_SEC = 30
+_subscription_usage_cache: tuple[float, list[SubscriptionUsage]] | None = None
+_subscription_usage_lock = asyncio.Lock()
+
 
 def _now() -> float:
     return time_mod.monotonic()
@@ -387,6 +416,64 @@ async def list_reservations() -> list[Reservation]:
 def invalidate_reservations_cache() -> None:
     global _reservations_cache
     _reservations_cache = None
+
+
+async def list_subscription_usage() -> list[SubscriptionUsage]:
+    """Report current-period session usage for every subscription on the account.
+
+    Reads ``getProfile → subscriptions → currentPeriodUsage`` (the same field the
+    members portal uses to show "X of Y sessions used"). Lets callers see the
+    period ``limit`` and how many sessions are already committed *before* a
+    booking fails with "you are out of sessions". Cached in-memory for 30s."""
+    if not settings.pushpress_email or not settings.pushpress_password:
+        raise RuntimeError("PUSHPRESS_EMAIL / PUSHPRESS_PASSWORD not set")
+    global _subscription_usage_cache
+    if _subscription_usage_cache and _now() - _subscription_usage_cache[0] < _SUBSCRIPTION_USAGE_TTL_SEC:
+        return _subscription_usage_cache[1]
+    async with _subscription_usage_lock:
+        if _subscription_usage_cache and _now() - _subscription_usage_cache[0] < _SUBSCRIPTION_USAGE_TTL_SEC:
+            return _subscription_usage_cache[1]
+        await ensure_token()  # populate _active_token so the uuids below resolve
+        client_uuid = token_client_uuid()
+        user_uuid = token_user_uuid()
+        data = await _gql(
+            _QUERY_SUBSCRIPTION_USAGE,
+            {"clientUuid": client_uuid, "userUuid": user_uuid},
+        )
+        profile = data.get("profile") or {}
+        out: list[SubscriptionUsage] = []
+        for s in profile.get("subscriptions") or []:
+            try:
+                out.append(_to_subscription_usage(s))
+            except Exception as e:
+                logger.warning(
+                    "Skip malformed subscription {}: {}", s.get("subscriptionUuid"), e
+                )
+        _subscription_usage_cache = (_now(), out)
+        return out
+
+
+def _to_subscription_usage(s: dict) -> SubscriptionUsage:
+    usage = s.get("currentPeriodUsage") or {}
+    raw_limit = usage.get("limit")
+    limit = int(raw_limit) if isinstance(raw_limit, (int, float)) else None
+    reservations = int(usage.get("reservations") or 0)
+    checkins = int(usage.get("checkins") or 0)
+    used = reservations + checkins
+    remaining = max(limit - used, 0) if limit is not None else None
+    return SubscriptionUsage(
+        subscription_uuid=s.get("subscriptionUuid") or "",
+        plan=s.get("plan") or "",
+        status=s.get("status") or "",
+        limit=limit,
+        reservations=reservations,
+        checkins=checkins,
+        used=used,
+        remaining=remaining,
+        period=str(usage.get("period") or ""),
+        period_start=str(usage.get("periodStart") or ""),
+        period_end=str(usage.get("periodEnd") or ""),
+    )
 
 
 async def book(calendar_item_uuid: str) -> BookingResult:
@@ -651,6 +738,31 @@ query GetProfiles($clientUuid: String!, $userUuid: String!) {
       status
       active
       plan
+      __typename
+    }
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_SUBSCRIPTION_USAGE = """
+query GetSubscriptionUsage($clientUuid: String!, $userUuid: String!) {
+  profile: getProfile(getProfileInput: {clientUuid: $clientUuid, userUuid: $userUuid}) {
+    subscriptions {
+      subscriptionUuid
+      status
+      active
+      plan
+      currentPeriodUsage {
+        limit
+        reservations
+        checkins
+        period
+        periodStart
+        periodEnd
+        __typename
+      }
       __typename
     }
     __typename

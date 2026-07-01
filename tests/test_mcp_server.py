@@ -68,6 +68,31 @@ async def test_get_schedule_bad_date_raises():
             await client.call_tool("get_schedule", {"start_date": "not-a-date"})
 
 
+async def test_get_session_credits_returns_serialized_usage(monkeypatch):
+    usage = pushpress.SubscriptionUsage(
+        subscription_uuid="sub-1",
+        plan="plan-1",
+        status="active",
+        limit=9,
+        reservations=3,
+        checkins=5,
+        used=8,
+        remaining=1,
+        period="A",
+        period_start="2026-06-19",
+        period_end="2026-07-16",
+    )
+    monkeypatch.setattr(
+        pushpress, "list_subscription_usage", AsyncMock(return_value=[usage])
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_session_credits", {})
+    assert isinstance(result.data, list)
+    assert result.data[0]["subscription_uuid"] == "sub-1"
+    assert result.data[0]["limit"] == 9
+    assert result.data[0]["remaining"] == 1
+
+
 async def test_book_class_schedules_reminders_on_success(monkeypatch):
     monkeypatch.setattr(
         pushpress,

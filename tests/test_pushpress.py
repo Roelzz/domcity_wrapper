@@ -51,6 +51,7 @@ def fake_token(request, monkeypatch):
     pushpress._tenant = None
     pushpress._reservations_cache = None
     pushpress._schedule_cache.clear()
+    pushpress._subscription_usage_cache = None
 
 
 def test_decode_jwt_extracts_claims():
@@ -144,6 +145,103 @@ async def test_list_reservations_filters_cancelled():
     items = await pushpress.list_reservations()
     assert len(items) == 1
     assert items[0].id == "reg-1"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_list_subscription_usage_computes_remaining():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "profile": {
+                        "subscriptions": [
+                            {
+                                "subscriptionUuid": "sub-1",
+                                "status": "active",
+                                "active": True,
+                                "plan": "plan-1",
+                                "currentPeriodUsage": {
+                                    "limit": 9,
+                                    "reservations": 3,
+                                    "checkins": 5,
+                                    "period": "A",
+                                    "periodStart": "2026-06-19",
+                                    "periodEnd": "2026-07-16",
+                                    "__typename": "SubscriptionPeriodUsage",
+                                },
+                                "__typename": "Subscription",
+                            }
+                        ],
+                        "__typename": "Profile",
+                    },
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    usage = await pushpress.list_subscription_usage()
+    assert len(usage) == 1
+    u = usage[0]
+    assert u.subscription_uuid == "sub-1"
+    assert u.limit == 9
+    assert u.reservations == 3
+    assert u.checkins == 5
+    assert u.used == 8
+    assert u.remaining == 1
+    assert u.period_start == "2026-06-19"
+    assert u.period_end == "2026-07-16"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_list_subscription_usage_unlimited_has_no_remaining():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "profile": {
+                        "subscriptions": [
+                            {
+                                "subscriptionUuid": "sub-unl",
+                                "status": "active",
+                                "active": True,
+                                "plan": "unlimited",
+                                "currentPeriodUsage": {
+                                    "limit": None,
+                                    "reservations": 2,
+                                    "checkins": 4,
+                                    "period": "A",
+                                    "periodStart": "2026-06-19",
+                                    "periodEnd": "2026-07-16",
+                                    "__typename": "SubscriptionPeriodUsage",
+                                },
+                                "__typename": "Subscription",
+                            }
+                        ],
+                        "__typename": "Profile",
+                    },
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    usage = await pushpress.list_subscription_usage()
+    assert len(usage) == 1
+    u = usage[0]
+    assert u.limit is None
+    assert u.used == 6
+    assert u.remaining is None
+
+
+@pytest.mark.asyncio
+async def test_list_subscription_usage_no_creds_raises(monkeypatch):
+    monkeypatch.setattr(pushpress.settings, "pushpress_email", "")
+    monkeypatch.setattr(pushpress.settings, "pushpress_password", "")
+    with pytest.raises(RuntimeError, match="PUSHPRESS_EMAIL"):
+        await pushpress.list_subscription_usage()
 
 
 @respx.mock

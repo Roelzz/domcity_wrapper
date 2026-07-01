@@ -81,7 +81,7 @@ The app exposes itself as an **MCP server** at `/mcp`, so Claude can read your s
 
 ### Tools
 
-Read: `get_schedule`, `get_reservations`, `get_stats`, `get_tenant_info`, `list_automation_rules`.
+Read: `get_schedule`, `get_reservations`, `get_stats`, `get_session_credits`, `get_tenant_info`, `list_automation_rules`.
 Write (real side effects on your gym account): `book_class`, `cancel_reservation`, `create_automation_rule`, `toggle_automation_rule`, `pause_automation_rule`, `delete_automation_rule`, `fire_automation_rule`.
 
 Because MCP runs **in the same process** as the web app, it shares the live APScheduler, SQLite DB, and cached PushPress token — so a rule created by Claude is armed by the scheduler exactly like one created in the web UI.
