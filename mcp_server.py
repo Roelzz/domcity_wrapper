@@ -86,6 +86,21 @@ async def get_tenant_info() -> dict:
 
 
 @mcp.tool
+async def get_session_credits() -> list[dict]:
+    """Show your PushPress session/credit balance for the current billing period.
+
+    PushPress caps how many sessions each subscription may book per period. For
+    every subscription this returns the period ``limit``, sessions already
+    committed (``reservations`` = upcoming bookings, ``checkins`` = attended),
+    ``used`` (their sum), ``remaining`` credits, and the period window
+    (``period_start``/``period_end``). ``remaining`` is ``null`` for unlimited
+    plans. Use this to see whether you are out of sessions *before* a booking
+    fails with "you are out of sessions for this class"."""
+    usage = await pushpress.list_subscription_usage()
+    return [u.model_dump(mode="json") for u in usage]
+
+
+@mcp.tool
 def list_automation_rules() -> list[dict]:
     """List all booking automation rules and their current state (enabled,
     paused-until, backup chain)."""
