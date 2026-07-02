@@ -765,7 +765,11 @@ async def automation_fire(rule_id: int):
     logger.info("Manually firing rule {} ('{}')", rule_id, rule.name)
     slot, _ = await scheduler.find_next_matching_slot(rule)
     if slot is None:
-        raise HTTPException(400, "no matching class found in next 14 days")
+        raise HTTPException(
+            400,
+            "no bookable class found in next 14 days "
+            "(any matches may already be booked)",
+        )
     await scheduler.booking_window_job(rule_id, 0, slot.id, manual=True)
     return RedirectResponse("/automation", status_code=303)
 
