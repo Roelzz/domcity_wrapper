@@ -4,6 +4,10 @@
 <section>
   <header class="page-head"><h2>Stats</h2></header>
 
+  {% if overbooked %}
+    <article class="warn-box">⏰ Overbooked: {{ scheduled_before_end }} booking{{ 's' if scheduled_before_end != 1 }} scheduled before {{ credits.period_end }}, but only {{ credits.remaining }} credit{{ 's' if credits.remaining != 1 }} left. Consider pausing a rule on the Automation page.</article>
+  {% endif %}
+
   <div class="stat-grid">
     <article class="stat-card">
       <strong class="stat-number">{{ n_success }}</strong>
@@ -21,7 +25,35 @@
       <strong class="stat-number">{{ n_failure }}</strong>
       <span class="muted">failures</span>
     </article>
+    {% if credits %}
+    <article class="stat-card">
+      <strong class="stat-number {% if credits.remaining == 0 %}error{% elif overbooked %}warn{% endif %}">{% if credits.remaining is not none %}{{ credits.remaining }}{% if credits.limit is not none %}/{{ credits.limit }}{% endif %}{% else %}∞{% endif %}</strong>
+      <span class="muted">credits left</span>
+    </article>
+    {% endif %}
   </div>
+
+  {% if credits %}
+  <article>
+    <header><strong>Session credits</strong>{% if credits.plan %} <small class="muted">— {{ credits.plan }}</small>{% endif %}</header>
+    <table>
+      <tbody>
+        <tr>
+          <td>Remaining</td>
+          <td><strong class="{% if credits.remaining == 0 %}error{% elif overbooked %}warn{% else %}success{% endif %}">{% if credits.remaining is not none %}{{ credits.remaining }}{% else %}unlimited{% endif %}</strong></td>
+        </tr>
+        <tr><td>Limit</td><td>{% if credits.limit is not none %}{{ credits.limit }}{% else %}—{% endif %}</td></tr>
+        <tr><td>Used</td><td>{{ credits.used }} <small class="muted">({{ credits.reservations }} reservations · {{ credits.checkins }} check-ins)</small></td></tr>
+        {% if credits.remaining is not none %}
+        <tr><td>Scheduled before period end</td><td>{{ scheduled_before_end }}</td></tr>
+        {% endif %}
+        <tr><td>Period ends</td><td>{{ credits.period_end or '—' }}</td></tr>
+      </tbody>
+    </table>
+  </article>
+  {% else %}
+  <p class="muted small">Session-credit data is currently unavailable.</p>
+  {% endif %}
 
   <article>
     <header><strong>Last 8 weeks — successful bookings</strong></header>
