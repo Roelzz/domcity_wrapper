@@ -474,7 +474,10 @@ async def fire_automation_rule(rule_id: int) -> dict:
     logger.info("MCP manually firing rule {} ('{}')", rule_id, rule.name)
     slot, _ = await scheduler.find_next_matching_slot(rule)
     if slot is None:
-        raise ToolError("no matching class found in the next 14 days")
+        raise ToolError(
+            "no bookable class found in the next 14 days "
+            "(any matches may already be booked)"
+        )
     outcome = await scheduler.booking_window_job(rule_id, 0, slot.id, manual=True)
     return {
         "ok": True,

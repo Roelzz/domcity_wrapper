@@ -367,14 +367,20 @@ def _rule_matches(rule: AutomationRule, s, now: datetime) -> bool:
 
 
 async def find_next_matching_slot(
-    rule: AutomationRule, after: datetime | None = None
+    rule: AutomationRule, after: datetime | None = None, exclude_booked: bool = True
 ):
     """Look up the next class in PushPress matching this rule. Returns
     (ClassSlot, target_datetime) or (None, target_datetime_hint).
 
     Kept for backward compat with manual-fire and the backup-chain lookup,
     which both need a single "next" candidate. Horizon scheduling uses
-    find_all_matching_slots instead."""
+    find_all_matching_slots instead.
+
+    When exclude_booked (default), slots the user already holds a reservation
+    for are dropped — mirroring horizon_scan — so a manual fire rolls forward
+    to the next genuinely-open class instead of re-targeting a booked, now-full
+    slot. Fail-open: if the reservations lookup errors we exclude nothing, so a
+    broken reservations call can never hide every candidate."""
     after = after or datetime.now(tz())
     hint = next_class_datetime(rule, now=after)
     start = hint.date() - timedelta(days=1)
@@ -386,6 +392,18 @@ async def find_next_matching_slot(
         return None, hint
     candidates = [s for s in slots if _rule_matches(rule, s, after)]
     candidates.sort(key=lambda s: s.start)
+    if exclude_booked:
+        try:
+            reservations = await pushpress.list_reservations()
+            booked_class_ids = {r.class_id for r in reservations}
+        except Exception as e:
+            logger.warning(
+                "find_next_matching_slot rule {}: reservations fetch failed, "
+                "not excluding booked slots: {}",
+                rule.id, e,
+            )
+            booked_class_ids = set()
+        candidates = [s for s in candidates if s.id not in booked_class_ids]
     return (candidates[0] if candidates else None), hint
 
 

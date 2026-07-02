@@ -5,7 +5,7 @@ import pytest
 
 import scheduler
 from models import AutomationRule
-from pushpress import ClassSlot
+from pushpress import ClassSlot, Reservation
 
 TZ = ZoneInfo("Europe/Amsterdam")
 
@@ -629,7 +629,7 @@ def test_manual_fire_endpoint_no_slot_returns_400(monkeypatch):
                 db.commit()
 
     assert r.status_code == 400
-    assert "no matching class" in r.text.lower()
+    assert "no bookable class" in r.text.lower()
 
 
 def test_automation_backup_for_mode_renders_cascading_form(monkeypatch):
@@ -835,6 +835,142 @@ async def test_horizon_scan_skips_already_reserved_slots(monkeypatch):
 
     assert queued_ids == ["rule-1-slot-w2"], (
         "w1 is already booked; only w2 should get queued"
+    )
+
+
+# ---- find_next_matching_slot: already-booked exclusion --------------------
+
+
+def _rsv(class_id: str) -> Reservation:
+    return Reservation(
+        id=f"res-{class_id}",
+        class_id=class_id,
+        class_name="OV | Classic CrossFit",
+        location="Overste den Oudenlaan 9",
+        start=datetime(2026, 5, 27, 18, 30, tzinfo=TZ),
+        end=datetime(2026, 5, 27, 19, 30, tzinfo=TZ),
+    )
+
+
+def _patch_schedule_and_reservations(monkeypatch, slots, reservations):
+    """Point find_next_matching_slot at fixed slots and reservations.
+
+    `reservations` may be an Exception instance/class to exercise the
+    fail-open branch."""
+    async def fake_list_schedule(start, end):
+        return slots
+
+    async def fake_list_reservations():
+        if isinstance(reservations, BaseException) or (
+            isinstance(reservations, type) and issubclass(reservations, BaseException)
+        ):
+            raise reservations if isinstance(reservations, BaseException) else reservations()
+        return reservations
+
+    monkeypatch.setattr(scheduler.pushpress, "list_schedule", fake_list_schedule)
+    monkeypatch.setattr(scheduler.pushpress, "list_reservations", fake_list_reservations)
+
+
+# after=Wed 20 May 2026 12:00 keeps both Wed-18:30 slots in the future,
+# so tests don't drift with the real clock.
+_AFTER = datetime(2026, 5, 20, 12, 0, tzinfo=TZ)
+_W1 = datetime(2026, 5, 27, 18, 30, tzinfo=TZ)
+_W2 = datetime(2026, 6, 3, 18, 30, tzinfo=TZ)
+
+
+@pytest.mark.asyncio
+async def test_find_next_skips_already_booked_nearest_returns_next(monkeypatch):
+    """The nearest chronological match is already booked -> roll forward to the
+    next unbooked slot instead of re-targeting the booked (now-full) one. This
+    is the manual-fire / backup bug fix."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", _W1)
+    week2 = _ov_slot("w2", _W2)
+    _patch_schedule_and_reservations(monkeypatch, [week1, week2], [_rsv("w1")])
+
+    slot, _hint = await scheduler.find_next_matching_slot(rule, after=_AFTER)
+
+    assert slot is not None and slot.id == "w2", (
+        "w1 is booked; must return the next unbooked match w2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_next_returns_nearest_when_nothing_booked(monkeypatch):
+    """No reservations -> behaviour is unchanged: return the nearest match."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", _W1)
+    week2 = _ov_slot("w2", _W2)
+    _patch_schedule_and_reservations(monkeypatch, [week1, week2], [])
+
+    slot, _hint = await scheduler.find_next_matching_slot(rule, after=_AFTER)
+
+    assert slot is not None and slot.id == "w1"
+
+
+@pytest.mark.asyncio
+async def test_find_next_returns_none_when_all_matches_booked(monkeypatch):
+    """Every upcoming match is already booked -> (None, hint): the honest
+    'nothing left to book' signal the callers translate into a clear message."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", _W1)
+    week2 = _ov_slot("w2", _W2)
+    _patch_schedule_and_reservations(
+        monkeypatch, [week1, week2], [_rsv("w1"), _rsv("w2")]
+    )
+
+    slot, hint = await scheduler.find_next_matching_slot(rule, after=_AFTER)
+
+    assert slot is None, "all matches booked -> no bookable slot"
+    assert hint is not None, "hint datetime is still returned"
+
+
+@pytest.mark.asyncio
+async def test_find_next_fails_open_when_reservations_error(monkeypatch):
+    """If the reservations lookup raises, exclude nothing (fail-open) and fall
+    back to the nearest match — a broken reservations call must never make a
+    legit rule un-fireable."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", _W1)
+    week2 = _ov_slot("w2", _W2)
+    _patch_schedule_and_reservations(
+        monkeypatch, [week1, week2], RuntimeError("pushpress down")
+    )
+
+    slot, _hint = await scheduler.find_next_matching_slot(rule, after=_AFTER)
+
+    assert slot is not None and slot.id == "w1", (
+        "reservations error -> fail-open, return nearest match, no crash"
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_next_exclude_booked_false_keeps_old_behaviour(monkeypatch):
+    """exclude_booked=False bypasses the reservations lookup entirely and
+    returns the nearest match even if it's booked (backward-compatible)."""
+    rule = _backup_rule(1)
+    week1 = _ov_slot("w1", _W1)
+    week2 = _ov_slot("w2", _W2)
+
+    called = {"reservations": False}
+
+    async def fake_list_schedule(start, end):
+        return [week1, week2]
+
+    async def fake_list_reservations():
+        called["reservations"] = True
+        return [_rsv("w1")]
+
+    monkeypatch.setattr(scheduler.pushpress, "list_schedule", fake_list_schedule)
+    monkeypatch.setattr(scheduler.pushpress, "list_reservations", fake_list_reservations)
+
+    slot, _hint = await scheduler.find_next_matching_slot(
+        rule, after=_AFTER, exclude_booked=False
+    )
+
+    assert slot is not None and slot.id == "w1"
+    assert called["reservations"] is False, (
+        "exclude_booked=False must not fetch reservations at all"
     )
 
 
