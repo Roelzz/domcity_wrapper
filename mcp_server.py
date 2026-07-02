@@ -110,10 +110,24 @@ def list_automation_rules() -> list[dict]:
 
 
 @mcp.tool
-def get_stats() -> dict:
-    """Booking-automation statistics: overall success/failure/polling/retry
-    counts, success rate, total and enabled rule counts, an 8-week success
-    timeline, per-rule stats, and successful bookings per class category."""
+async def get_stats() -> dict:
+    """Booking-automation statistics with credit context and failure diagnostics.
+
+    Overall success/failure/polling/retry counts, success rate, total and enabled
+    rule counts, an 8-week success timeline, per-rule stats, and successful
+    bookings per class category — PLUS:
+
+    - ``credits``: your live PushPress budget (``remaining``/``limit``/``used``/
+      ``period_start``/``period_end``) for the gating subscription. ``null`` if
+      the lookup fails (never blanks the rest of the stats).
+    - ``overbooked``: ``true`` when the enabled rules will attempt more bookings
+      before ``period_end`` than you have credits left.
+    - ``by_reason``: overall breakdown of *why* terminal failures happened
+      (``out_of_credits``/``class_full``/``window_not_open``/…).
+    - each ``per_rule`` entry also carries ``success_rate``, a ``reasons``
+      breakdown, and a ``health`` verdict (``healthy``/``credit_capped``/
+      ``loses_capacity_race``/``fires_before_window``/``thrashing``/``no_data``)
+      so a 3/199 record reads as "credit_capped", not a mystery."""
     with DbSession(engine) as db:
         attempts = db.exec(select(BookingAttempt)).all()
         rules = db.exec(select(AutomationRule)).all()
@@ -145,6 +159,13 @@ def get_stats() -> dict:
             succ = sum(1 for a in rule_attempts if a.status == "success")
             fail = sum(1 for a in rule_attempts if a.status == "failure")
             last = max((a.fired_at for a in rule_attempts), default=None)
+            reasons: dict[str, int] = {}
+            for a in rule_attempts:
+                if a.status == "failure":
+                    bucket = scheduler._classify_reason(a.message or "")
+                    reasons[bucket] = reasons.get(bucket, 0) + 1
+            r_decisive = succ + fail
+            r_rate = (succ / r_decisive * 100) if r_decisive else 0.0
             rule_stats.append(
                 {
                     "rule_id": r.id,
@@ -152,18 +173,47 @@ def get_stats() -> dict:
                     "category": r.class_category,
                     "success": succ,
                     "failure": fail,
+                    "success_rate": round(r_rate, 1),
+                    "reasons": reasons,
+                    "health": _health_verdict(succ, fail, reasons),
                     "last_attempt": last.isoformat() if last else None,
                 }
             )
         rule_stats.sort(key=lambda x: -x["success"])
 
         by_category: dict[str, int] = {}
+        by_reason: dict[str, int] = {}
         for a in attempts:
-            if a.status != "success":
-                continue
-            rule = next((r for r in rules if r.id == a.rule_id), None)
-            if rule:
-                by_category[rule.class_category] = by_category.get(rule.class_category, 0) + 1
+            if a.status == "success":
+                rule = next((r for r in rules if r.id == a.rule_id), None)
+                if rule:
+                    by_category[rule.class_category] = by_category.get(rule.class_category, 0) + 1
+            elif a.status == "failure":
+                bucket = scheduler._classify_reason(a.message or "")
+                by_reason[bucket] = by_reason.get(bucket, 0) + 1
+
+    # Credit context — fail-open: a broken lookup returns null, never blanks stats.
+    credits: dict | None = None
+    overbooked = False
+    try:
+        usage = await pushpress.list_subscription_usage()
+        gating = scheduler._gating_usage(usage)
+        if gating is not None:
+            credits = {
+                "plan": gating.plan,
+                "limit": gating.limit,
+                "used": gating.used,
+                "reservations": gating.reservations,
+                "checkins": gating.checkins,
+                "remaining": gating.remaining,
+                "period_start": gating.period_start,
+                "period_end": gating.period_end,
+            }
+            if gating.remaining is not None:
+                total, _ = await scheduler.scheduled_bookings_before_period_end(usage)
+                overbooked = total > gating.remaining
+    except Exception as e:
+        logger.warning("get_stats: credit lookup failed: {}", e)
 
     return {
         "n_success": n_success,
@@ -173,10 +223,105 @@ def get_stats() -> dict:
         "success_rate": round(success_rate, 1),
         "total_rules": len(rules),
         "enabled_count": enabled_count,
+        "credits": credits,
+        "overbooked": overbooked,
         "weekly_timeline": weeks,
         "per_rule": rule_stats,
+        "by_reason": [{"reason": k, "count": v} for k, v in
+                      sorted(by_reason.items(), key=lambda kv: -kv[1])],
         "per_category": [{"category": k, "successes": v} for k, v in
                          sorted(by_category.items(), key=lambda kv: -kv[1])],
+    }
+
+
+@mcp.tool
+async def get_automation_forecast() -> dict:
+    """Will the enabled automations overrun your session-credit budget before the
+    billing period resets? Read-only forecast — books nothing.
+
+    Compares ``remaining`` credits against how many bookings the enabled,
+    non-paused rules will attempt on or before ``period_end`` (slots you have
+    already booked are excluded). Returns ``credits``, ``period_end``,
+    ``scheduled_before_period_end`` (a count plus a per-rule slot list annotated
+    with each rule's ``health``), an ``overbooked`` flag, a ``recommendation``
+    naming the worst-health rule to pause (when overbooked), and a plain-language
+    ``summary``. Fails open: ``credits`` is ``null`` if the lookup errors."""
+    try:
+        usage = await pushpress.list_subscription_usage()
+    except Exception as e:
+        logger.warning("get_automation_forecast: usage lookup failed: {}", e)
+        return {
+            "credits": None,
+            "period_end": None,
+            "scheduled_before_period_end": {"count": 0, "per_rule": []},
+            "overbooked": False,
+            "recommendation": None,
+            "summary": "Credit lookup failed — cannot forecast right now.",
+        }
+
+    gating = scheduler._gating_usage(usage)
+    total, per_rule = await scheduler.scheduled_bookings_before_period_end(usage)
+    remaining = gating.remaining if gating else None
+    period_end = gating.period_end if gating else None
+    overbooked = remaining is not None and total > remaining
+
+    health = _rule_health_map([r["rule_id"] for r in per_rule])
+    for r in per_rule:
+        h = health.get(r["rule_id"], {})
+        r["health"] = h.get("health", "no_data")
+        r["success_rate"] = h.get("success_rate", 0.0)
+
+    recommendation = None
+    if overbooked and per_rule:
+        worst = min(
+            per_rule,
+            key=lambda r: (_HEALTH_RANK.get(r["health"], 9), r["success_rate"]),
+        )
+        recommendation = {
+            "rule_id": worst["rule_id"],
+            "name": worst["name"],
+            "health": worst["health"],
+            "action": (
+                f"consider pausing rule {worst['rule_id']} ({worst['name']}) "
+                f"via pause_automation_rule"
+            ),
+        }
+
+    if remaining is None:
+        summary = (
+            f"No finite session cap detected — {total} booking(s) scheduled "
+            f"before {period_end or 'period end'}, budget looks unlimited."
+        )
+    elif overbooked:
+        summary = (
+            f"Overbooked: {total} booking(s) scheduled before {period_end} but "
+            f"only {remaining} credit(s) left. "
+            + (recommendation["action"] + "." if recommendation else "")
+        )
+    else:
+        summary = (
+            f"On track: {total} booking(s) scheduled before {period_end} and "
+            f"{remaining} credit(s) remaining."
+        )
+
+    credits = None
+    if gating is not None:
+        credits = {
+            "plan": gating.plan,
+            "limit": gating.limit,
+            "used": gating.used,
+            "remaining": gating.remaining,
+            "period_start": gating.period_start,
+            "period_end": gating.period_end,
+        }
+
+    return {
+        "credits": credits,
+        "period_end": period_end,
+        "scheduled_before_period_end": {"count": total, "per_rule": per_rule},
+        "overbooked": overbooked,
+        "recommendation": recommendation,
+        "summary": summary,
     }
 
 
@@ -313,9 +458,13 @@ async def delete_automation_rule(rule_id: int) -> dict:
 
 @mcp.tool
 async def fire_automation_rule(rule_id: int) -> dict:
-    """Manually trigger a rule right now — books the next matching class in the
-    next 14 days. Useful to test a rule. The rule must be enabled. Returns a
-    confirmation with the targeted slot."""
+    """Manually trigger a rule right now — attempts to book the next matching
+    class in the next 14 days. Useful to test a rule. The rule must be enabled.
+
+    Returns the targeted slot plus the actual ``outcome`` of the attempt, so a
+    credit skip surfaces clearly (e.g. ``"skipped: out of credits, period ends
+    2026-07-16"``) instead of a vague OK. ``booked`` is ``true`` only when the
+    booking succeeded."""
     with DbSession(engine) as db:
         rule = db.get(AutomationRule, rule_id)
         if not rule:
@@ -326,9 +475,11 @@ async def fire_automation_rule(rule_id: int) -> dict:
     slot, _ = await scheduler.find_next_matching_slot(rule)
     if slot is None:
         raise ToolError("no matching class found in the next 14 days")
-    await scheduler.booking_window_job(rule_id, 0, slot.id, manual=True)
+    outcome = await scheduler.booking_window_job(rule_id, 0, slot.id, manual=True)
     return {
         "ok": True,
+        "booked": outcome == "booked",
+        "outcome": outcome,
         "rule_id": rule_id,
         "targeted_class": slot.name,
         "targeted_start": slot.start.isoformat(),
@@ -365,6 +516,63 @@ async def mcp_login(request: Request) -> Response:
     except ValueError as e:
         return HTMLResponse(_login_html(txn="", error=str(e)), status_code=400)
     return RedirectResponse(redirect_url, status_code=303)
+
+
+_HEALTH_RANK = {
+    "credit_capped": 0,
+    "loses_capacity_race": 1,
+    "fires_before_window": 2,
+    "thrashing": 3,
+    "healthy": 4,
+    "no_data": 5,
+}
+
+
+def _health_verdict(succ: int, fail: int, reasons: dict[str, int]) -> str:
+    """Derive a rule's health from its decisive attempts (no schema change).
+
+    Terminal-decisive = success + terminal failure (retry/polling excluded, as
+    the caller only feeds those two). ≥70% success is ``healthy``; otherwise the
+    dominant failure reason names the pathology so a bad record is actionable."""
+    decisive = succ + fail
+    if decisive == 0:
+        return "no_data"
+    if (succ / decisive) >= 0.70:
+        return "healthy"
+    if not reasons:
+        return "thrashing"
+    dominant = max(reasons.items(), key=lambda kv: kv[1])[0]
+    return {
+        "out_of_credits": "credit_capped",
+        "class_full": "loses_capacity_race",
+        "window_not_open": "fires_before_window",
+    }.get(dominant, "thrashing")
+
+
+def _rule_health_map(rule_ids: list[int]) -> dict[int, dict]:
+    """Compute ``{rule_id: {success_rate, health}}`` from historical attempts."""
+    if not rule_ids:
+        return {}
+    with DbSession(engine) as db:
+        attempts = db.exec(
+            select(BookingAttempt).where(BookingAttempt.rule_id.in_(rule_ids))
+        ).all()
+    out: dict[int, dict] = {}
+    for rid in rule_ids:
+        ra = [a for a in attempts if a.rule_id == rid]
+        succ = sum(1 for a in ra if a.status == "success")
+        fail = sum(1 for a in ra if a.status == "failure")
+        reasons: dict[str, int] = {}
+        for a in ra:
+            if a.status == "failure":
+                bucket = scheduler._classify_reason(a.message or "")
+                reasons[bucket] = reasons.get(bucket, 0) + 1
+        r_dec = succ + fail
+        out[rid] = {
+            "success_rate": round((succ / r_dec * 100) if r_dec else 0.0, 1),
+            "health": _health_verdict(succ, fail, reasons),
+        }
+    return out
 
 
 def _rule_to_dict(rule: AutomationRule) -> dict:

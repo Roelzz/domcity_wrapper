@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
         scheduler.schedule_token_refresh()
         scheduler.schedule_reminder_scan()
         scheduler.schedule_daily_digest()
+        scheduler.schedule_credit_warning()
         scheduler.schedule_horizon_refresh()
         logger.info("Domcity Planner up on port {}", settings.port)
         yield
