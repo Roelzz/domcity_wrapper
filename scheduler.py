@@ -6,7 +6,7 @@ the rule is re-scheduled against the following week's class."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -26,6 +26,7 @@ REMINDER_SCAN_INTERVAL_MIN = 15 # how often to refresh per-reservation reminders
 REMINDER_DAY_HOUR = 8           # local hour for the same-day reminder
 REMINDER_PRE_MIN = 30           # minutes before class start for the late reminder
 MAX_CHAIN_DEPTH = 5             # hard cap on backup-rule chain length
+WARNING_LEAD_DAYS = 3           # warn this many days before period_end if overbooked
 
 # Substrings about the USER's account — retrying won't help no matter how long.
 # Kept tight on purpose: a bare "expired" matches "Token expired" (transient!)
@@ -45,6 +46,7 @@ USER_TERMINAL_KEYWORDS = (
     "no active membership",
     "subscription is not active",
     "not allowed",
+    "out of session",
     "class is full",
     "fully booked",
     "no spots",
@@ -61,6 +63,36 @@ USER_TERMINAL_KEYWORDS = (
 def _is_user_terminal(msg: str) -> bool:
     low = (msg or "").lower()
     return any(kw in low for kw in USER_TERMINAL_KEYWORDS)
+
+
+# Coarse buckets for the "why did this rule fail?" insight. Pure/no-I/O so it
+# runs over historical BookingAttempt.message rows too. Order matters: the most
+# specific phrases win — "out of sessions" before generic terms, and class_full
+# before window_not_open so "class full at window open" classifies as full.
+_REASON_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("out_of_credits", ("out of session", "no sessions", "out of credits", "exceeded")),
+    ("already_booked", ("already reserved",)),
+    ("slot_gone", ("disappeared", "no longer on schedule")),
+    (
+        "class_full",
+        (
+            "class full", "class is full", "fully booked", "sold out",
+            "no spots", "no spot", "no available spots", "capacity",
+            "waitlist", "no space", "no longer available", "registration cap",
+        ),
+    ),
+    ("window_not_open", ("registration has not", "not yet started", "window")),
+)
+
+
+def _classify_reason(message: str) -> str:
+    """Map a BookingAttempt message/reason to a coarse bucket for insight."""
+    low = (message or "").lower()
+    for bucket, keywords in _REASON_RULES:
+        if any(kw in low for kw in keywords):
+            return bucket
+    return "other"
+
 
 _scheduler: AsyncIOScheduler | None = None
 
@@ -124,6 +156,53 @@ def schedule_daily_digest() -> None:
         replace_existing=True,
     )
     logger.info("Daily digest cron scheduled at 09:00 {}", settings.tz)
+
+
+def schedule_credit_warning() -> None:
+    """Daily 08:55 cron — five minutes before the digest flush — that queues an
+    overbook warning into the digest buffer when scheduled bookings before
+    period_end exceed remaining credits. Riding the 09:00 digest keeps it to at
+    most one Telegram per day."""
+    sch = get_scheduler()
+    sch.add_job(
+        credit_warning_job,
+        "cron",
+        hour=8,
+        minute=55,
+        id="credit-warning",
+        replace_existing=True,
+    )
+    logger.info("Credit warning cron scheduled at 08:55 {}", settings.tz)
+
+
+async def credit_warning_job() -> None:
+    """Queue a heads-up (for the 09:00 digest) when the automations will attempt
+    more bookings before period_end than there are credits left, and period_end
+    is within WARNING_LEAD_DAYS. Fails silent on any lookup error — a broken
+    forecast must never crash the cron."""
+    try:
+        usage = await pushpress.list_subscription_usage()
+    except Exception as e:
+        logger.warning("credit warning: usage lookup failed: {}", e)
+        return
+    gating = _gating_usage(usage)
+    if gating is None or gating.remaining is None:
+        return
+    period_end = _parse_period_end(gating.period_end)
+    if period_end is None:
+        return
+    days_left = (period_end - datetime.now(tz()).date()).days
+    if days_left < 0 or days_left > WARNING_LEAD_DAYS:
+        return
+    total, per_rule = await scheduled_bookings_before_period_end(usage)
+    if total <= gating.remaining:
+        return
+    names = ", ".join(f"{r['name']} (×{r['count']})" for r in per_rule)
+    notify.queue_for_digest(
+        f"⚠️ Credit overbook: {total} bookings scheduled before {gating.period_end} "
+        f"but only {gating.remaining} credit(s) left. Rules: {names}. "
+        f"Consider pausing one via pause_automation_rule."
+    )
 
 
 def schedule_reminder_scan() -> None:
@@ -325,6 +404,107 @@ def window_open_time(slot) -> datetime:
     return slot.start.astimezone(tz()) + timedelta(minutes=offset_min)
 
 
+# --- Credit awareness ------------------------------------------------------ #
+def _gating_usage(usage: list) -> pushpress.SubscriptionUsage | None:
+    """The subscription that actually constrains booking: the finite-cap sub
+    with the fewest remaining sessions. None when no sub exposes a finite cap
+    (nothing to gate on)."""
+    finite = [u for u in usage if u.remaining is not None]
+    if not finite:
+        return None
+    return min(finite, key=lambda u: u.remaining)
+
+
+def _parse_period_end(period_end: str | None) -> date | None:
+    """PushPress periodEnd is an ISO date string ('2026-07-16'); tolerate a
+    datetime prefix or an empty/None value. None when unparseable."""
+    if not period_end:
+        return None
+    try:
+        return date.fromisoformat(period_end[:10])
+    except ValueError:
+        return None
+
+
+async def _credit_gate() -> tuple[bool, str | None]:
+    """Decide whether a booking should be skipped because the session-credit
+    budget is exhausted. Returns (blocked, period_end).
+
+    blocked is True only when the gating subscription reports remaining <= 0.
+    Fails OPEN: if the usage lookup raises (creds unset, API down) we return
+    (False, None) so a broken credit check never blocks a legit booking."""
+    try:
+        usage = await pushpress.list_subscription_usage()
+    except Exception as e:
+        logger.warning("credit pre-check failed, proceeding with booking: {}", e)
+        return False, None
+    gating = _gating_usage(usage)
+    if gating is None or gating.remaining is None:
+        return False, None
+    if gating.remaining <= 0:
+        return True, (gating.period_end or None)
+    return False, None
+
+
+async def scheduled_bookings_before_period_end(
+    usage: list, now: datetime | None = None
+) -> tuple[int, list[dict]]:
+    """How many bookings the active primary rules will attempt on or before the
+    gating subscription's period_end, excluding already-reserved slots.
+
+    One schedule fetch + one reservations fetch, reused across every rule, so
+    cost doesn't scale with rule count. Returns (total, per_rule) where per_rule
+    is a list of {rule_id, name, count, slots:[iso...]}. Returns (0, []) when
+    there's no finite-cap sub or period_end is unparseable. find_all_matching_slots
+    already applies the paused_until + future filters; we only add the
+    period_end + already-booked cuts here."""
+    now = now or datetime.now(tz())
+    gating = _gating_usage(usage)
+    if gating is None:
+        return 0, []
+    period_end = _parse_period_end(gating.period_end)
+    if period_end is None:
+        return 0, []
+
+    try:
+        all_slots = await pushpress.list_schedule(now.date(), period_end + timedelta(days=1))
+    except Exception as e:
+        logger.warning("forecast: schedule fetch failed: {}", e)
+        return 0, []
+    try:
+        reservations = await pushpress.list_reservations()
+        booked_ids = {r.class_id for r in reservations}
+    except Exception as e:
+        logger.warning("forecast: reservations fetch failed: {}", e)
+        booked_ids = set()
+
+    with DbSession(engine) as db:
+        rules = db.exec(
+            select(AutomationRule).where(
+                AutomationRule.enabled == True,  # noqa: E712
+                AutomationRule.backup_only == False,  # noqa: E712
+            )
+        ).all()
+
+    total = 0
+    per_rule: list[dict] = []
+    for rule in rules:
+        wanted = [
+            s for s in find_all_matching_slots(rule, all_slots, now)
+            if s.start.astimezone(tz()).date() <= period_end and s.id not in booked_ids
+        ]
+        if not wanted:
+            continue
+        total += len(wanted)
+        per_rule.append({
+            "rule_id": rule.id,
+            "name": rule.name,
+            "count": len(wanted),
+            "slots": [s.start.astimezone(tz()).isoformat() for s in wanted],
+        })
+    return total, per_rule
+
+
 async def horizon_refresh_all() -> None:
     """Refresh every enabled primary rule's horizon. Performs ONE schedule
     fetch + ONE reservations fetch and reuses them across rules, so adding
@@ -481,10 +661,15 @@ async def booking_window_job(
     calendar_item_uuid: str,
     chained_from: set[int] | None = None,
     manual: bool = False,
-) -> None:
+) -> str:
     """One-shot job: try to book the specific class this rule was queued for.
+    Returns a short outcome string ("booked", "skipped: out of credits…",
+    "failed: …", …) so callers like fire_automation_rule can report it; the
+    cron scheduler simply ignores the return value.
     Branches:
       - success → log + notify (no re-arm; the daily horizon cron handles that)
+      - out of credits → skip + record "skipped" + notify (no chain; a backup
+        hits the same flat period cap)
       - class full at window-open → chain to backup if set, else flag user
       - "already reserved" → silent no-op (idempotent, we have the booking)
       - user-terminal error → maybe chain + give up
@@ -501,7 +686,7 @@ async def booking_window_job(
         rule = db.get(AutomationRule, rule_id)
         if not rule or not rule.enabled:
             logger.info("Rule {} missing or disabled, skipping", rule_id)
-            return
+            return "rule missing or disabled"
 
     now = datetime.now(tz())
     if not manual:
@@ -515,7 +700,7 @@ async def booking_window_job(
             notify.queue_for_digest(
                 f"⚠️ rule {rule_id} ('{rule.name}') loop-guarded ({elapsed:.0f}s)"
             )
-            return
+            return "loop-guarded"
         _last_fire_at[rule_id] = now
 
     slot = await _lookup_slot(calendar_item_uuid)
@@ -531,7 +716,7 @@ async def booking_window_job(
             "target class disappeared before booking",
             chained_from=chained_from, notify_immediate=False,
         )
-        return
+        return "target class disappeared before booking"
 
     class_start = slot.start.astimezone(tz())
     target_label = f"{rule.name} — {class_start.strftime('%a %d %b %H:%M')}"
@@ -549,15 +734,30 @@ async def booking_window_job(
             chained_from=chained_from,
             notify_immediate=rule.backup_rule_id is None,
         )
-        return
+        return reason
+
+    # Credit pre-check: the single choke point every booking path converges on
+    # (scheduled, manual fire, backup chain). If the session-credit budget is
+    # spent, skip rather than burn a guaranteed-fail API call. No backup chain —
+    # a backup hits the same flat period cap. Fails open (see _credit_gate).
+    blocked, period_end = await _credit_gate()
+    if blocked:
+        tail = f", period ends {period_end}" if period_end else ""
+        reason = f"skipped: out of credits{tail}"
+        logger.info("Rule {}: {} — not booking {}", rule_id, reason, target_label)
+        _record(rule.id, target_label, "skipped", reason)
+        await notify.send(f"⏸️ {rule.name}: {reason}")
+        return reason
 
     try:
         result = await pushpress.book(slot.id)
     except Exception as e:
-        return await _handle_failure(
-            rule, attempt, target_label, f"book call raised: {e}",
+        msg = f"book call raised: {e}"
+        await _handle_failure(
+            rule, attempt, target_label, msg,
             slot=slot, chained_from=chained_from,
         )
+        return f"error: {msg}"
     if result.ok:
         _record(rule.id, target_label, "success", result.message or "booked")
         await notify.send(f"✅ Booked: {target_label}")
@@ -567,11 +767,13 @@ async def booking_window_job(
         # No per-success re-arm: every matching slot in the horizon already
         # has its own queued job. The daily horizon cron catches anything
         # the in-process scheduler missed (e.g. across a restart).
-    else:
-        await _handle_failure(
-            rule, attempt, target_label, result.message,
-            slot=slot, chained_from=chained_from,
-        )
+        return "booked"
+
+    await _handle_failure(
+        rule, attempt, target_label, result.message,
+        slot=slot, chained_from=chained_from,
+    )
+    return f"failed: {result.message}"
 
 
 async def _lookup_slot(calendar_item_uuid: str):

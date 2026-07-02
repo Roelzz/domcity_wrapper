@@ -179,3 +179,184 @@ async def test_toggle_unknown_rule_raises():
     async with Client(mcp) as client:
         with pytest.raises(ToolError):
             await client.call_tool("toggle_automation_rule", {"rule_id": 999, "enabled": False})
+
+
+# --- Credit-aware insight/foresight tools ---------------------------------- #
+def _usage(remaining, *, limit=9, period_end="2026-07-16"):
+    used = max(limit - remaining, 0)
+    return pushpress.SubscriptionUsage(
+        subscription_uuid="sub-1",
+        plan="unlimited-plan",
+        status="active",
+        limit=limit,
+        reservations=used,
+        checkins=0,
+        used=used,
+        remaining=remaining,
+        period="A",
+        period_start="2026-06-19",
+        period_end=period_end,
+    )
+
+
+def _insert_rule_with_failures(reason_msg: str, n_fail: int = 3, n_success: int = 0) -> int:
+    """Insert a rule plus terminal failure/success attempts; return the rule id."""
+    with DbSession(engine) as db:
+        rule = AutomationRule(
+            name="OV Classic",
+            location="Overste den Oudenlaan 9",
+            class_category="Classic CrossFit",
+            day_of_week=0,
+            time_of_day=time(18, 30),
+            enabled=True,
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        rid = rule.id
+        for _ in range(n_fail):
+            db.add(models.BookingAttempt(
+                rule_id=rid, target_class="OV Classic", status="failure", message=reason_msg
+            ))
+        for _ in range(n_success):
+            db.add(models.BookingAttempt(
+                rule_id=rid, target_class="OV Classic", status="success", message="booked"
+            ))
+        db.commit()
+    return rid
+
+
+async def test_get_stats_surfaces_credits_overbooked_and_health(monkeypatch):
+    rid = _insert_rule_with_failures("You are out of sessions for this class", n_fail=3)
+    monkeypatch.setattr(
+        pushpress, "list_subscription_usage", AsyncMock(return_value=[_usage(1)])
+    )
+    # Isolate the forecast count: 2 scheduled vs 1 remaining -> overbooked.
+    monkeypatch.setattr(
+        scheduler,
+        "scheduled_bookings_before_period_end",
+        AsyncMock(return_value=(2, [{"rule_id": rid, "name": "OV Classic", "count": 2, "slots": []}])),
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_stats", {})
+
+    data = result.data
+    assert data["credits"]["remaining"] == 1
+    assert data["credits"]["limit"] == 9
+    assert data["overbooked"] is True
+    reasons = {r["reason"]: r["count"] for r in data["by_reason"]}
+    assert reasons.get("out_of_credits") == 3
+    rule_row = next(r for r in data["per_rule"] if r["rule_id"] == rid)
+    assert rule_row["health"] == "credit_capped"
+    assert rule_row["reasons"]["out_of_credits"] == 3
+    assert rule_row["success_rate"] == 0.0
+
+
+async def test_get_stats_fails_open_when_credits_unavailable(monkeypatch):
+    _insert_rule_with_failures("class is full", n_fail=1)
+    monkeypatch.setattr(
+        pushpress,
+        "list_subscription_usage",
+        AsyncMock(side_effect=RuntimeError("creds unset")),
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_stats", {})
+
+    data = result.data
+    assert data["credits"] is None
+    assert data["overbooked"] is False
+    # Rest of the stats are still populated.
+    assert data["n_failure"] == 1
+    assert {r["reason"] for r in data["by_reason"]} == {"class_full"}
+
+
+async def test_forecast_overbooked_recommends_worst_rule(monkeypatch):
+    rid = _insert_rule_with_failures("You are out of sessions for this class", n_fail=3)
+    monkeypatch.setattr(
+        pushpress, "list_subscription_usage", AsyncMock(return_value=[_usage(1)])
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "scheduled_bookings_before_period_end",
+        AsyncMock(return_value=(2, [{"rule_id": rid, "name": "OV Classic", "count": 2, "slots": []}])),
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_automation_forecast", {})
+
+    data = result.data
+    assert data["overbooked"] is True
+    assert data["scheduled_before_period_end"]["count"] == 2
+    assert data["recommendation"] is not None
+    assert data["recommendation"]["rule_id"] == rid
+    assert "pause_automation_rule" in data["recommendation"]["action"]
+    row = data["scheduled_before_period_end"]["per_rule"][0]
+    assert row["health"] == "credit_capped"
+
+
+async def test_forecast_on_track_has_no_recommendation(monkeypatch):
+    rid = _insert_rule_with_failures("booked", n_fail=0, n_success=2)
+    monkeypatch.setattr(
+        pushpress, "list_subscription_usage", AsyncMock(return_value=[_usage(5)])
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "scheduled_bookings_before_period_end",
+        AsyncMock(return_value=(2, [{"rule_id": rid, "name": "OV Classic", "count": 2, "slots": []}])),
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_automation_forecast", {})
+
+    data = result.data
+    assert data["overbooked"] is False
+    assert data["recommendation"] is None
+    assert "On track" in data["summary"]
+
+
+async def test_forecast_fails_open_on_usage_error(monkeypatch):
+    monkeypatch.setattr(
+        pushpress,
+        "list_subscription_usage",
+        AsyncMock(side_effect=RuntimeError("creds unset")),
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_automation_forecast", {})
+
+    data = result.data
+    assert data["credits"] is None
+    assert data["overbooked"] is False
+    assert data["scheduled_before_period_end"]["count"] == 0
+
+
+async def test_fire_automation_rule_reports_credit_skip(monkeypatch):
+    with DbSession(engine) as db:
+        rule = AutomationRule(
+            name="OV Classic",
+            location="Overste den Oudenlaan 9",
+            class_category="Classic CrossFit",
+            day_of_week=0,
+            time_of_day=time(18, 30),
+            enabled=True,
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        rid = rule.id
+
+    monkeypatch.setattr(
+        scheduler,
+        "find_next_matching_slot",
+        AsyncMock(return_value=(_slot(), None)),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "booking_window_job",
+        AsyncMock(return_value="skipped: out of credits, period ends 2026-07-16"),
+    )
+    async with Client(mcp) as client:
+        result = await client.call_tool("fire_automation_rule", {"rule_id": rid})
+
+    data = result.data
+    assert data["ok"] is True
+    assert data["booked"] is False
+    assert data["outcome"].startswith("skipped: out of credits")
+    assert data["targeted_class"] == "Classic CrossFit"

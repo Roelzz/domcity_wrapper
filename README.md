@@ -13,6 +13,7 @@ Built for one gym member ("Dom city" = Utrecht), deployed on a home server via C
 - **Auto-refreshing PushPress auth** — the app logs in with email + password on startup, caches the JWT in SQLite, re-logs in via a daily 03:00 cron whenever < 7 days remain. No manual token paste. 401/403 from a GraphQL call triggers an inline refresh + retry.
 - **Telegram reminders** — two pings per booked class: 📅 same-day at 08:00 local, ⏰ 30 minutes before class start. Includes location + instructor. Plus success/failure messages on every automation attempt.
 - **iCal feed** — `/calendar.ics?token=…` returns your active reservations as a subscribable calendar. Drop the URL into Apple Calendar / Google / Fastmail.
+- **Credit-aware automation** — the scheduler checks your PushPress **session-credit budget before every booking** and skips (instead of failing) at 0 remaining. `get_stats` and the new `get_automation_forecast` MCP tool surface remaining credits, an `overbooked` flag, categorised failure reasons, and a per-rule **health verdict** — plus a daily heads-up if your rules are about to overrun the period cap. See [Credit-aware automation](#credit-aware-automation).
 - **/stats** — bookings dashboard: success rate, weekly timeline, per-rule and per-category breakdown.
 - **MCP server** — use the gym from **Claude** (Desktop + phone). Read your schedule and book/cancel/automate by chatting, via an `/mcp` endpoint protected by a self-hosted OAuth login. See [MCP server (Claude)](#mcp-server-claude).
 
@@ -81,10 +82,24 @@ The app exposes itself as an **MCP server** at `/mcp`, so Claude can read your s
 
 ### Tools
 
-Read: `get_schedule`, `get_reservations`, `get_stats`, `get_session_credits`, `get_tenant_info`, `list_automation_rules`.
+Read: `get_schedule`, `get_reservations`, `get_stats`, `get_session_credits`, `get_automation_forecast`, `get_tenant_info`, `list_automation_rules`.
 Write (real side effects on your gym account): `book_class`, `cancel_reservation`, `create_automation_rule`, `toggle_automation_rule`, `pause_automation_rule`, `delete_automation_rule`, `fire_automation_rule`.
 
 Because MCP runs **in the same process** as the web app, it shares the live APScheduler, SQLite DB, and cached PushPress token — so a rule created by Claude is armed by the scheduler exactly like one created in the web UI.
+
+### Credit-aware automation
+
+PushPress subscriptions have a **session cap per billing period** (e.g. 9 sessions, resetting on the period end date). The automation is wired to respect that budget instead of blindly firing and failing:
+
+- **0-credit gate.** Before any booking POST — scheduled, manual `fire_automation_rule`, or backup-chain — the scheduler checks remaining credits. At `remaining == 0` it **skips the attempt** (logs a `skipped` `BookingAttempt`, sends a Telegram note, does **not** chain to a backup since a backup hits the same flat cap) instead of burning a guaranteed API rejection. Fails open: if the credit lookup errors, the booking still proceeds.
+- **Terminal "out of sessions".** A per-class "out of sessions" rejection is now treated as terminal, so it no longer wastes 5×30s of transient retries before giving up.
+- **Credits in `get_stats`.** Answers "will my rules overrun my budget?" directly: a live `credits` block (`remaining`/`limit`/`used`/`period_start`/`period_end`), an `overbooked` flag, an overall `by_reason` failure breakdown, and per-rule `success_rate` + `reasons` + a `health` verdict (`healthy` / `credit_capped` / `loses_capacity_race` / `fires_before_window` / `thrashing` / `no_data`) — so a lopsided 3/199 record reads as "credit_capped", not a mystery.
+- **`get_automation_forecast`.** Read-only look-ahead: compares `remaining` credits against how many bookings the enabled rules will attempt before `period_end`, returns an `overbooked` flag, and — when overbooked — a `recommendation` naming the worst-health rule to pause (via `pause_automation_rule`).
+- **Daily warning.** An 08:55 cron rides the existing 09:00 Telegram digest: if scheduled bookings exceed remaining credits within the next 3 days, it queues a heads-up so you hear about it *before* a booking fails.
+
+> Health verdicts are **derived at read time** from existing `BookingAttempt.message` rows via a shared reason classifier — no schema change, and it works retroactively on historical data.
+>
+> Deferred: **per-class** credit gating (the PushPress API doesn't expose per-class entitlements — only the flat period cap) and automatic **cross-rule priority arbitration** (the forecast recommendation keeps a human in the loop instead).
 
 ### Auth
 
@@ -114,7 +129,7 @@ uv run ruff check .
 uv run pytest
 ```
 
-Tests cover title parsing, scheduler timing + matching, route auth + filters, GraphQL client (mocked via respx), login flow, the MCP tool wrappers (via FastMCP's in-memory client), and the self-hosted OAuth credential gate + PKCE code round-trip.
+Tests cover title parsing, scheduler timing + matching, the credit gate + reason classifier + overbooked forecast, route auth + filters, GraphQL client (mocked via respx), login flow, the MCP tool wrappers (via FastMCP's in-memory client, including the enriched `get_stats` + `get_automation_forecast`), and the self-hosted OAuth credential gate + PKCE code round-trip.
 
 
 
@@ -182,11 +197,12 @@ When the job runs:
 
 1. Refreshes the matched class (state may have changed in the last few days).
 2. If `spots_available == 0` at window-open → skip the doomed POST, switch to poll mode.
-3. Otherwise, POST `createReservation`.
-4. **Success** → log `BookingAttempt(status=success)`, Telegram ✅, schedule reminders, re-schedule rule for the following week's class.
-5. **Class full** error → switch to poll mode.
-6. **Terminal user error** (cap exceeded / already reserved / membership / etc.) → Telegram ❌, give up, re-arm for next week.
-7. **Transient** (network / 5xx) → retry every 30s, up to 5 attempts.
+3. **Credit gate** — if you have `0` remaining session credits for the period → skip the POST, log `BookingAttempt(status=skipped)`, Telegram note, give up for this week (no backup chain — a backup hits the same cap). Fails open if the credit lookup errors.
+4. Otherwise, POST `createReservation`.
+5. **Success** → log `BookingAttempt(status=success)`, Telegram ✅, schedule reminders, re-schedule rule for the following week's class.
+6. **Class full** error → switch to poll mode.
+7. **Terminal user error** (cap exceeded / out of sessions / already reserved / membership / etc.) → Telegram ❌, give up, re-arm for next week.
+8. **Transient** (network / 5xx) → retry every 30s, up to 5 attempts.
 
 ### Poll mode (when class is full)
 

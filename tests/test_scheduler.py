@@ -836,3 +836,267 @@ async def test_horizon_scan_skips_already_reserved_slots(monkeypatch):
     assert queued_ids == ["rule-1-slot-w2"], (
         "w1 is already booked; only w2 should get queued"
     )
+
+
+# ---- Credit awareness: classifier, gate, skip, forecast, warning ----------
+
+from datetime import date as _date  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+from pushpress import SubscriptionUsage  # noqa: E402
+
+
+def _usage(remaining, period_end="2026-07-16", limit=9):
+    used = None if remaining is None else max(limit - remaining, 0)
+    return SubscriptionUsage(
+        subscription_uuid="sub-1",
+        plan="plan-1",
+        status="active",
+        limit=limit,
+        reservations=used or 0,
+        checkins=0,
+        used=used,
+        remaining=remaining,
+        period="A",
+        period_start="2026-06-19",
+        period_end=period_end,
+    )
+
+
+class _ExecFakeDb:
+    """Fake Session whose exec().all() returns a fixed rule list (used by the
+    shared forecast helper, which queries rules via db.exec(select(...))."""
+
+    def __init__(self, rules):
+        self._rules = rules
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def exec(self, _query):
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def all(self):
+                return self._rows
+
+        return _Result(self._rules)
+
+
+def test_classify_reason_buckets():
+    assert scheduler._classify_reason("terminal: You are out of sessions") == "out_of_credits"
+    assert scheduler._classify_reason("cap exceeded") == "out_of_credits"
+    assert scheduler._classify_reason("already reserved") == "already_booked"
+    assert scheduler._classify_reason("class full at window open (0/14)") == "class_full"
+    assert scheduler._classify_reason("no spots left") == "class_full"
+    assert scheduler._classify_reason("registration has not yet started") == "window_not_open"
+    assert scheduler._classify_reason("target class disappeared") == "slot_gone"
+    assert scheduler._classify_reason("some random transient blip") == "other"
+    assert scheduler._classify_reason("") == "other"
+
+
+def test_out_of_sessions_is_user_terminal():
+    """Regression: 'out of sessions' must be terminal so a per-class credit
+    rejection doesn't burn 5x30s of transient retries."""
+    assert scheduler._is_user_terminal("You are out of sessions for this class") is True
+    assert scheduler._is_user_terminal("out of session") is True
+    # A genuine transient stays non-terminal.
+    assert scheduler._is_user_terminal("connection reset by peer") is False
+
+
+@pytest.mark.asyncio
+async def test_credit_gate_blocks_when_remaining_zero(monkeypatch):
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(return_value=[_usage(remaining=0)]),
+    )
+    blocked, period_end = await scheduler._credit_gate()
+    assert blocked is True
+    assert period_end == "2026-07-16"
+
+
+@pytest.mark.asyncio
+async def test_credit_gate_open_when_credits_available(monkeypatch):
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(return_value=[_usage(remaining=2)]),
+    )
+    blocked, period_end = await scheduler._credit_gate()
+    assert blocked is False
+    assert period_end is None
+
+
+@pytest.mark.asyncio
+async def test_credit_gate_fails_open_on_lookup_error(monkeypatch):
+    """A broken credit lookup must NEVER block a legit booking."""
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(side_effect=RuntimeError("api down")),
+    )
+    blocked, period_end = await scheduler._credit_gate()
+    assert blocked is False
+    assert period_end is None
+
+
+@pytest.mark.asyncio
+async def test_booking_window_job_skips_on_zero_credits(monkeypatch, reset_loop_guard):
+    """0 remaining credits: skip the booking entirely — book() NOT called,
+    a 'skipped' attempt recorded, the user notified, no backup chain, and the
+    outcome string surfaced for the caller."""
+    rule = _backup_rule(1, backup_rule_id=2)  # has a backup — must NOT chain
+    slot = _ov_slot("cal-zero", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5)
+
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _FakeDb(rule))
+    async def fake_lookup(uuid):
+        return slot
+    monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(return_value=[_usage(remaining=0)]),
+    )
+
+    book_calls: list[str] = []
+    async def fake_book(uuid):
+        from pushpress import BookingResult
+        book_calls.append(uuid)
+        return BookingResult(ok=True, reservation_id="r", message="booked")
+    monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
+
+    chain_calls: list = []
+    async def fake_chain(*a, **k):
+        chain_calls.append(True)
+        return True
+    monkeypatch.setattr(scheduler, "_chain_to_backup", fake_chain)
+
+    send_calls: list[str] = []
+    async def fake_send(msg):
+        send_calls.append(msg)
+    monkeypatch.setattr(scheduler.notify, "send", fake_send)
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda *_a, **_k: None)
+
+    record_calls: list[tuple] = []
+    monkeypatch.setattr(
+        scheduler, "_record",
+        lambda *a, **k: record_calls.append(a),
+    )
+
+    outcome = await scheduler.booking_window_job(1, 0, "cal-zero")
+
+    assert book_calls == [], "must not call book() when out of credits"
+    assert chain_calls == [], "0-credit skip must not chain to backup"
+    assert outcome == "skipped: out of credits, period ends 2026-07-16"
+    assert any(r[2] == "skipped" for r in record_calls), "a 'skipped' attempt must be recorded"
+    assert len(send_calls) == 1 and "out of credits" in send_calls[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_booking_window_job_books_when_credits_available(monkeypatch, reset_loop_guard):
+    """With credits remaining, the gate is transparent — book() is called and
+    the outcome is 'booked'."""
+    rule = _backup_rule(1)
+    slot = _ov_slot("cal-ok", datetime(2026, 6, 3, 18, 30, tzinfo=TZ), spots=5)
+
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _FakeDb(rule))
+    async def fake_lookup(uuid):
+        return slot
+    monkeypatch.setattr(scheduler, "_lookup_slot", fake_lookup)
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(return_value=[_usage(remaining=2)]),
+    )
+
+    book_calls: list[str] = []
+    async def fake_book(uuid):
+        from pushpress import BookingResult
+        book_calls.append(uuid)
+        return BookingResult(ok=True, reservation_id="r", message="booked")
+    monkeypatch.setattr(scheduler.pushpress, "book", fake_book)
+    monkeypatch.setattr(scheduler.notify, "send", _async_noop)
+    monkeypatch.setattr(scheduler, "reminder_scan_job", _async_noop)
+    monkeypatch.setattr(scheduler, "_record", lambda *_a, **_k: None)
+
+    outcome = await scheduler.booking_window_job(1, 0, "cal-ok")
+
+    assert book_calls == ["cal-ok"]
+    assert outcome == "booked"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_bookings_before_period_end_counts_matches(monkeypatch):
+    """The shared forecast helper counts every matching, unbooked slot on or
+    before period_end across active primary rules."""
+    rule = make_rule(dow=2, hh=18, mm=30)  # Wed 18:30 OV Classic CrossFit
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=TZ)
+    # Two Wednesdays before 16 Jul, one already booked, one after period_end.
+    w1 = _ov_slot("w1", datetime(2026, 6, 3, 18, 30, tzinfo=TZ))
+    w2 = _ov_slot("w2", datetime(2026, 6, 10, 18, 30, tzinfo=TZ))
+    booked = _ov_slot("bk", datetime(2026, 6, 17, 18, 30, tzinfo=TZ))
+    after = _ov_slot("late", datetime(2026, 7, 22, 18, 30, tzinfo=TZ))  # > period_end
+
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_schedule",
+        AsyncMock(return_value=[w1, w2, booked, after]),
+    )
+
+    class _Res:
+        class_id = "bk"
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_reservations",
+        AsyncMock(return_value=[_Res()]),
+    )
+    monkeypatch.setattr(scheduler, "DbSession", lambda *_a, **_k: _ExecFakeDb([rule]))
+
+    total, per_rule = await scheduler.scheduled_bookings_before_period_end(
+        [_usage(remaining=1)], now=now,
+    )
+
+    assert total == 2, "w1 + w2 count; booked slot and post-period slot excluded"
+    assert len(per_rule) == 1
+    assert per_rule[0]["count"] == 2
+    assert per_rule[0]["rule_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_credit_warning_job_queues_when_overbooked(monkeypatch):
+    """When scheduled bookings before a near period_end exceed remaining
+    credits, a heads-up is queued for the daily digest."""
+    near = (_date.today() + timedelta(days=2)).isoformat()
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(return_value=[_usage(remaining=1, period_end=near)]),
+    )
+    monkeypatch.setattr(
+        scheduler, "scheduled_bookings_before_period_end",
+        AsyncMock(return_value=(3, [{"rule_id": 1, "name": "Wed Classic", "count": 3, "slots": []}])),
+    )
+    queued: list[str] = []
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda m: queued.append(m))
+
+    await scheduler.credit_warning_job()
+
+    assert len(queued) == 1
+    assert "overbook" in queued[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_credit_warning_job_silent_within_budget(monkeypatch):
+    """No warning when scheduled bookings fit inside the remaining budget."""
+    near = (_date.today() + timedelta(days=2)).isoformat()
+    monkeypatch.setattr(
+        scheduler.pushpress, "list_subscription_usage",
+        AsyncMock(return_value=[_usage(remaining=5, period_end=near)]),
+    )
+    monkeypatch.setattr(
+        scheduler, "scheduled_bookings_before_period_end",
+        AsyncMock(return_value=(2, [{"rule_id": 1, "name": "Wed Classic", "count": 2, "slots": []}])),
+    )
+    queued: list[str] = []
+    monkeypatch.setattr(scheduler.notify, "queue_for_digest", lambda m: queued.append(m))
+
+    await scheduler.credit_warning_job()
+
+    assert queued == []
