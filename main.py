@@ -371,6 +371,34 @@ async def stats_page(request: Request):
             by_category[rule.class_category] += 1
     categories_sorted = sorted(by_category.items(), key=lambda kv: -kv[1])
 
+    # Session credits — live budget from PushPress. Mirrors the get_stats MCP
+    # tool and fails open: a broken/unset credit lookup must never blank the
+    # dashboard, so credits stays None and the credit UI is simply skipped.
+    credits: dict | None = None
+    overbooked = False
+    scheduled_before_end = 0
+    try:
+        usage = await pushpress.list_subscription_usage()
+        gating = scheduler._gating_usage(usage)
+        if gating is not None:
+            credits = {
+                "plan": gating.plan,
+                "limit": gating.limit,
+                "used": gating.used,
+                "reservations": gating.reservations,
+                "checkins": gating.checkins,
+                "remaining": gating.remaining,
+                "period_start": gating.period_start,
+                "period_end": gating.period_end,
+            }
+            if gating.remaining is not None:
+                scheduled_before_end, _ = (
+                    await scheduler.scheduled_bookings_before_period_end(usage)
+                )
+                overbooked = scheduled_before_end > gating.remaining
+    except Exception as e:
+        logger.warning("stats_page: credit lookup failed: {}", e)
+
     ctx = {
         "active": "stats",
         "n_success": n_success,
@@ -384,6 +412,9 @@ async def stats_page(request: Request):
         "max_count": max_count,
         "rule_stats": rule_stats,
         "categories_sorted": categories_sorted,
+        "credits": credits,
+        "overbooked": overbooked,
+        "scheduled_before_end": scheduled_before_end,
         "token_warning": _token_warning(),
     }
     return templates.TemplateResponse(request, "stats.html", ctx)
