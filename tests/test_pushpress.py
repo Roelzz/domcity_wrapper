@@ -526,3 +526,129 @@ async def test_book_returns_already_reserved_without_calling_mutation():
     assert result.message == "already reserved"
     # Exactly two GraphQL calls: profile + reservations. The mutation was skipped.
     assert route.call_count == 2
+
+
+# ---- Workout tests -------------------------------------------------------- #
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_of_day_parses_response():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getWorkoutOfDay": [
+                        {
+                            "uid": "wod-1",
+                            "workoutUid": "wku-abc",
+                            "workoutState": "PUBLISHED",
+                            "workoutProgramGroupId": "g1",
+                            "workoutProgramTemplateId": "t1",
+                            "imageUrl": "https://img.example.com/wod.png",
+                            "videoUrlId": "vid-1",
+                            "day": 3,
+                            "__typename": "WorkoutOfDay",
+                        }
+                    ],
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_of_day("2026-08-13", "4ebe07a3-b8f0-41ba-8e34-8d4cc2a09014")
+    assert len(result) == 1
+    assert result[0]["uid"] == "wod-1"
+    assert result[0]["workoutUid"] == "wku-abc"
+    assert result[0]["workoutState"] == "PUBLISHED"
+    assert result[0]["imageUrl"] == "https://img.example.com/wod.png"
+    assert result[0]["day"] == 3
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_of_day_empty():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getWorkoutOfDay": [],
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_of_day("2026-08-13", "nonexistent-uid")
+    assert result == []
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_scores_returns_empty():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "workoutGetScores": {
+                        "scores": [],
+                        "topScore": None,
+                        "__typename": "WorkoutPartScore",
+                    },
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_scores("part-1", "wku-abc")
+    assert result["scores"] == []
+    assert result["topScore"] is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_scores_with_data():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "workoutGetScores": {
+                        "scores": [
+                            {
+                                "id": "score-1",
+                                "date": "2026-08-13",
+                                "division": "RX",
+                                "sets": [{"weight": 95.0, "reps": 5}],
+                                "mine": True,
+                                "athleteUid": "usr_test",
+                                "athleteComment": "felt good",
+                                "workoutUid": "wku-abc",
+                                "workoutPartUid": "part-1",
+                                "__typename": "WorkoutLogScore",
+                            }
+                        ],
+                        "topScore": {
+                            "id": "score-2",
+                            "date": "2026-08-10",
+                            "division": "RX",
+                            "primaryScore": "12:34",
+                            "sets": [{"weight": 105.0, "reps": 5}],
+                            "athleteUid": "usr_test",
+                            "__typename": "WorkoutLogScore",
+                        },
+                        "__typename": "WorkoutPartScore",
+                    },
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_scores("part-1", "wku-abc")
+    assert len(result["scores"]) == 1
+    assert result["scores"][0]["sets"][0]["weight"] == 95.0
+    assert result["scores"][0]["sets"][0]["reps"] == 5
+    assert result["topScore"]["primaryScore"] == "12:34"
+    assert result["topScore"]["sets"][0]["weight"] == 105.0
