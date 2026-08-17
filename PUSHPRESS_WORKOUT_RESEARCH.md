@@ -287,13 +287,106 @@ Bekende Beperkingen
 7. Workout parts zijn leeg - getWorkoutPart retourneert null voor alle geteste UIDs
 8. Geen scores - workoutGetScores retourneert lege arrays
 
+Uitgeputte API Exploratie (17 aug 2026)
+----------------------------------------
+We hebben 50+ GraphQL queries, 20+ REST endpoints, 3 alternatieve domains,
+en Flutter JS analysis geprobeerd. Conclusie: de member-facing API exposeert
+géén workout exercises.
+
+GraphQL queries geprobeerd (allemaal gefaald of null response):
+  - getWorkout (uid/uuid)           → field bestaat niet
+  - getWorkoutProgram (uid)         → field bestaat niet
+  - getWorkoutProgramGroup (uid)    → field bestaat niet
+  - getWorkoutParts (workoutUid)    → field bestaat niet
+  - getExercises (workoutUid)       → field bestaat niet
+  - getWorkoutDetail (uid)          → field bestaat niet
+  - getWorkoutByClassType           → field bestaat niet
+  - getWorkoutSchedule              → field bestaat niet
+  - getClassTypeWorkouts            → field bestaat niet
+  - getWorkoutScheduleItems         → field bestaat niet
+  - getWorkoutPartsByWorkout        → field bestaat niet
+  - getStaticWorkoutParts           → field bestaat niet
+  - getWorkoutMedia                 → field bestaat niet
+  - getWorkoutPartDetail            → field bestaat niet
+  - getWorkoutPartExercises         → field bestaat niet
+  - getScoreDetails (scoreId)       → field bestaat niet (Float! nodig, niet Int!)
+  - getCalendarClassType            → 404 (fields classTypeUid/workoutUid bestaan niet)
+  - getDocuments                    → fields id/content bestaan niet op Document type
+  - benchmarkWorkouts               → fields uid/name bestaan niet op Workouts type
+  - weightliftingWorkoutHistory     → fields uid/date bestaan niet
+
+REST endpoints geprobeerd (allemaal 404):
+  - GET/POST /v2/workouts
+  - GET/POST /v2/workout-of-day
+  - GET/POST /v2/workoutOfDay
+  - GET/POST /v2/workoutOfTheDay
+  - GET/POST /v2/workoutParts
+  - GET/POST /v2/workout-parts
+  - GET/POST /v2/workout-part
+  - GET/POST /v2/exercises
+  - GET/POST /v2/workout-exercises
+  - GET/POST /v2/calendar/workouts
+  - GET/POST /v2/calendar/workout-of-day
+  - GET/POST /v2/schedule/workouts
+  - GET /workout/workoutOfDay/generate/deeplink/v2 → 404
+
+Alternatieve domains (allemaal CloudFront SPA / HTML shells):
+  - workouts.pushpress.com → CloudFront SPA, geen JSON API
+  - cdn.pushpress.com      → CloudFront SPA
+  - media.pushpress.com    → CloudFront SPA
+  - gym.pushpress.com      → CloudFront SPA
+
+Flutter app analyse (main.dart.js):
+  - Gebruikt dezelfde GraphQL queries: getWorkoutOfDay, getWorkoutPart
+  - Heeft benchmarkWorkouts systeem met classTypeId, date, workoutId, workoutParts
+  - Data model bevat: sets, scoreParts, scoreState, bestScores
+  - Maakt GEEN andere API calls dan de GraphQL queries die wij kennen
+
+WorkoutOfDayParts type schema (ontdekt via GraphQL errors):
+  - id (String?)
+  - workoutPartUid (String?)
+  - workoutUid (String?)
+  - unit (String?)
+  - sets (Float) — GEEN nested object, gewoon een Float!
+  - tags ([String]?)
+  - scoreType (String?)
+  - athletesNotes (String?)
+  - coachesNotes (String?)
+  - scoreCount (Int?)
+  - divisions ([String]?)
+  - defaultReps (Int?)
+  - GEEN exercises veld
+  - GEEN name veld
+
+WorkoutOfDay type schema (ontdekt via GraphQL errors):
+  - uid (String)
+  - workoutUid (String)
+  - workoutState (String) — PUBLISHED / UNPUBLISHED
+  - workoutProgramGroupId (String?) — altijd None bij deze gym
+  - workoutProgramTemplateId (String?) — altijd None bij deze gym
+  - imageUrl (String?) — altijd None bij deze gym
+  - videoUrlId (String?) — altijd None bij deze gym
+  - GEEN workoutParts veld
+  - GEEN exercises veld
+
+Conclusie:
+  - De gym heeft workoutProgramGroupId en workoutProgramTemplateId NIET configureerd
+  - getWorkoutPart retourneert null voor alle UIDs (geen warmup, A, B, main parts)
+  - workoutGetScores retourneert lege arrays (geen scores gelogd)
+  - Class descriptions zijn leeg (geen workout text embedded)
+  - De Flutter app TOONT exercises, maar de member API levert ze NIET
+
 Implementatie Status
 --------------------
 - get_workout_of_day()  : IMPLEMENTEERD - retourneert workout metadata (uid, workoutUid, workoutState)
 - get_workout_scores()  : IMPLEMENTEERD - retourneert scores arrays (momenteel leeg bij gym)
 
 Voor echte workout exercises (warmup, A, B met sets/reps) is waarschijnlijk nodig:
-  1. PushPress admin toegang, of
+  1. PushPress admin toegang (exercises configureren in admin panel), of
   2. Een ander systeem dat de gym gebruikt (bijv. Wodify, TrueCoach, etc.), of
   3. De workouts worden handmatig gedeeld via andere kanalen (WhatsApp, website, etc.)
+
+Opmerking: Zelfs als exercises geconfigureerd zijn in PushPress admin, zijn ze
+waarschijnlijk niet toegankelijk via de member-facing GraphQL API. De
+getWorkoutPart query retourneert null ongeacht welke UID je probeert.
 """
