@@ -330,11 +330,11 @@ async def get_workout_of_day(date: str, class_type_uid: str | None = None) -> li
     """Get the workout of the day for a class type on a given date (ISO
     ``YYYY-MM-DD``).
 
-    Returns workout metadata: ``uid``, ``workoutUid``, ``workoutState``,
-    ``imageUrl``, ``videoUrlId``, etc.
-
-    **Does NOT include exercises, sets, reps, or warmup data** — those are not
-    exposed via the member-facing PushPress GraphQL API.
+    Returns workout metadata plus the structured ``parts`` list. Each part is a
+    training segment (Warm-Up, A, B, METCON, ...) with its ``title``,
+    ``description`` (the actual movements, rounds, reps, time caps),
+    ``score_type`` (Time / Weight / Rounds / No Score), ``athletes_notes``,
+    ``coaches_notes``, ``score_count``, ``sets``, and ``default_reps``.
 
     Use ``get_class_types()`` to find the ``id`` (class type UID) for each
     class type. Common UIDs:

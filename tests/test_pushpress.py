@@ -549,6 +549,32 @@ async def test_get_workout_of_day_parses_response():
                             "imageUrl": "https://img.example.com/wod.png",
                             "videoUrlId": "vid-1",
                             "day": 3,
+                            "parts": [
+                                {
+                                    "workoutPartUid": "part-1",
+                                    "title": "Warm-Up",
+                                    "description": "AMRAP 5\n- 6 Calorie Row",
+                                    "scoreType": "No Score",
+                                    "athletesNotes": None,
+                                    "coachesNotes": "Cue: keep lats engaged",
+                                    "scoreCount": 0,
+                                    "sets": 1,
+                                    "defaultReps": None,
+                                    "__typename": "WorkoutOfDayParts",
+                                },
+                                {
+                                    "workoutPartUid": "part-2",
+                                    "title": "B. METCON",
+                                    "description": "For Time\n1000/800m Row",
+                                    "scoreType": "Time",
+                                    "athletesNotes": "Score: Time",
+                                    "coachesNotes": "Goal: grind",
+                                    "scoreCount": 12,
+                                    "sets": 1,
+                                    "defaultReps": None,
+                                    "__typename": "WorkoutOfDayParts",
+                                },
+                            ],
                             "__typename": "WorkoutOfDay",
                         }
                     ],
@@ -564,6 +590,50 @@ async def test_get_workout_of_day_parses_response():
     assert result[0]["workoutState"] == "PUBLISHED"
     assert result[0]["imageUrl"] == "https://img.example.com/wod.png"
     assert result[0]["day"] == 3
+    assert len(result[0]["parts"]) == 2
+    part0 = result[0]["parts"][0]
+    assert part0["workout_part_uid"] == "part-1"
+    assert part0["title"] == "Warm-Up"
+    assert part0["description"] == "AMRAP 5\n- 6 Calorie Row"
+    assert part0["score_type"] == "No Score"
+    assert part0["coaches_notes"] == "Cue: keep lats engaged"
+    assert part0["score_count"] == 0
+    assert part0["sets"] == 1
+    part1 = result[0]["parts"][1]
+    assert part1["title"] == "B. METCON"
+    assert part1["score_type"] == "Time"
+    assert part1["score_count"] == 12
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_of_day_parts_optional():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getWorkoutOfDay": [
+                        {
+                            "uid": "wod-2",
+                            "workoutUid": "wku-def",
+                            "workoutState": "PUBLISHED",
+                            "workoutProgramGroupId": None,
+                            "workoutProgramTemplateId": None,
+                            "imageUrl": None,
+                            "videoUrlId": None,
+                            "day": None,
+                            "__typename": "WorkoutOfDay",
+                        }
+                    ],
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_of_day("2026-08-13", "some-uid")
+    assert len(result) == 1
+    assert result[0]["parts"] == []
 
 
 @respx.mock

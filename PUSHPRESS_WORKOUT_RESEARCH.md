@@ -358,35 +358,50 @@ WorkoutOfDayParts type schema (ontdekt via GraphQL errors):
   - GEEN exercises veld
   - GEEN name veld
 
-WorkoutOfDay type schema (ontdekt via GraphQL errors):
+WorkoutOfDay type schema (ontdekt via GraphQL errors + reverse engineering van
+de Flutter member app `members.pushpress.com/main.dart.js`):
+
   - uid (String)
   - workoutUid (String)
   - workoutState (String) — PUBLISHED / UNPUBLISHED
-  - workoutProgramGroupId (String?) — altijd None bij deze gym
-  - workoutProgramTemplateId (String?) — altijd None bij deze gym
-  - imageUrl (String?) — altijd None bij deze gym
-  - videoUrlId (String?) — altijd None bij deze gym
-  - GEEN workoutParts veld
-  - GEEN exercises veld
+  - workoutProgramGroupId (String?) — None bij deze gym
+  - workoutProgramTemplateId (String?) — None bij deze gym
+  - imageUrl (String?) — None bij deze gym
+  - videoUrlId (String?) — None bij deze gym
+  - day (Int?)
+  - parts: [WorkoutOfDayParts!]!   <-- DE WORKOUT CONTENT ZIT HIER
+      - workoutPartUid (String)
+      - title (String)            — bv. "Warm-Up", "A. UPPER PULL", "B. METCON"
+      - description (String)      — de echte workout: movements, rounds, reps, time caps
+      - scoreType (String)        — Time / Weight / Rounds / No Score
+      - athletesNotes (String?)
+      - coachesNotes (String?)
+      - scoreCount (Int)
+      - sets (Int)
+      - defaultReps (Int?)
+
+BELANGRIJKE ONTDEKKING (2026-08-17):
+  De workout exercises/WOD ZIJN WEL beschikbaar via de member API — ze zitten in
+  het `parts` veld van getWorkoutOfDay. Eerdere pogingen faalden omdat:
+    1. We `parts` niet expliciet als subfield selecteerden (GraphQL vereist dit).
+    2. getWorkoutPart() retourneert null voor losse UIDs — maar dat is niet nodig,
+       de content komt gewoon mee in getWorkoutOfDay.parts.
+
+  Voorbeeld (Classic CrossFit 2026-08-17):
+    Warm-Up: "AMRAP 5\n- 6 Calorie Row\n- 10 Alternating Dumbbell Deadlift\n
+              - 5/5 Bent Over Rows\n- 6 Burpees"
+    A. UPPER PULL: "Every 2:30 x 4\n10/10 Chainsaw Row, Heavy\n
+                   6-10 Wide Pull Ring Rows"
+    B. METCON: "For Time\n1000/800m Row\n50 Alternating Dumbbell Clean & Jerk @ 22.5/15\n..."
 
 Conclusie:
-  - De gym heeft workoutProgramGroupId en workoutProgramTemplateId NIET configureerd
-  - getWorkoutPart retourneert null voor alle UIDs (geen warmup, A, B, main parts)
-  - workoutGetScores retourneert lege arrays (geen scores gelogd)
-  - Class descriptions zijn leeg (geen workout text embedded)
-  - De Flutter app TOONT exercises, maar de member API levert ze NIET
+  - De gym heeft workoutProgramGroupId / workoutProgramTemplateId NIET configureerd (None)
+  - workoutGetScores retourneert lege arrays (geen scores gelogd bij deze gym)
+  - De workout content (warmup, A, B met sets/reps) komt wél via getWorkoutOfDay.parts
+  - getWorkoutPart() op zichzelf is nutteloos (retourneert null) — negeren
 
 Implementatie Status
 --------------------
-- get_workout_of_day()  : IMPLEMENTEERD - retourneert workout metadata (uid, workoutUid, workoutState)
+- get_workout_of_day()  : IMPLEMENTEERD - retourneert workout metadata + parts[] (incl. description/title/scoreType)
 - get_workout_scores()  : IMPLEMENTEERD - retourneert scores arrays (momenteel leeg bij gym)
-
-Voor echte workout exercises (warmup, A, B met sets/reps) is waarschijnlijk nodig:
-  1. PushPress admin toegang (exercises configureren in admin panel), of
-  2. Een ander systeem dat de gym gebruikt (bijv. Wodify, TrueCoach, etc.), of
-  3. De workouts worden handmatig gedeeld via andere kanalen (WhatsApp, website, etc.)
-
-Opmerking: Zelfs als exercises geconfigureerd zijn in PushPress admin, zijn ze
-waarschijnlijk niet toegankelijk via de member-facing GraphQL API. De
-getWorkoutPart query retourneert null ongeacht welke UID je probeert.
 """
