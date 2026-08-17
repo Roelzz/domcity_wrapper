@@ -723,6 +723,85 @@ def _to_reservation(r: dict) -> Reservation:
     )
 
 
+# -------- New read-only API functions ----------------------------------------
+
+
+async def get_locations() -> list[dict]:
+    """Return all active gym locations with UUIDs and names."""
+    data = await _gql(_QUERY_LOCATIONS, {})
+    locations = data.get("locations") or []
+    return [{"uuid": loc["uuid"], "name": loc["name"], "is_active": loc.get("isActive")} for loc in locations]
+
+
+async def get_class_types(date: str | None = None) -> list[dict]:
+    """Return all available class types (Classic CrossFit, Functional, Hyrox, etc.).
+    
+    Optional ``date`` parameter (ISO YYYY-MM-DD) to filter by day. Defaults to today.
+    """
+    from datetime import datetime
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+    variables = {"date": date}
+    data = await _gql(_QUERY_CLASS_TYPES, variables)
+    class_types = data.get("classTypes") or []
+    return [{"id": ct["id"], "name": ct["name"]} for ct in class_types]
+
+
+async def get_class_details(uuid: str) -> dict:
+    """Return detailed info for a single class by its calendar item UUID."""
+    data = await _gql(_QUERY_CLASS, {"uuid": uuid})
+    ci = data.get("calendarItem") or {}
+    coach = ci.get("mainCoach") or {}
+    coach_name = " ".join(x for x in [coach.get("firstName"), coach.get("lastName")] if x) or None
+    location = (ci.get("location") or {}).get("name") or ""
+    return {
+        "uuid": ci.get("uuid"),
+        "title": ci.get("title"),
+        "start_datetime": ci.get("startDatetime"),
+        "end_datetime": ci.get("endDatetime"),
+        "attendance_cap": ci.get("attendanceCap"),
+        "spots_available": ci.get("spotsAvailable"),
+        "location": location,
+        "instructor": coach_name,
+        "description": ci.get("description") or "",
+    }
+
+
+async def get_member_info() -> dict:
+    """Return the logged-in member's profile: name, contact info, emergency
+    contact, and active subscriptions with credit usage."""
+    client_uuid = token_client_uuid()
+    user_uuid = token_user_uuid()
+    data = await _gql(_QUERY_MEMBER_INFO, {"clientUuid": client_uuid, "userUuid": user_uuid})
+    profile = data.get("profile") or {}
+    subs = []
+    for s in (profile.get("subscriptions") or []):
+        usage = s.get("currentPeriodUsage") or {}
+        subs.append({
+            "subscription_uuid": s.get("subscriptionUuid"),
+            "plan": s.get("plan"),
+            "status": s.get("status"),
+            "active": s.get("active"),
+            "limit": usage.get("limit"),
+            "reservations": usage.get("reservations"),
+            "checkins": usage.get("checkins"),
+            "period": usage.get("period"),
+            "period_start": usage.get("periodStart"),
+            "period_end": usage.get("periodEnd"),
+        })
+    return {
+        "first_name": profile.get("firstName"),
+        "last_name": profile.get("lastName"),
+        "email": profile.get("email"),
+        "phone": profile.get("phone"),
+        "address1": profile.get("address1"),
+        "address2": profile.get("address2"),
+        "emergency_name": profile.get("emergencyName"),
+        "emergency_phone": profile.get("emergencyPhone"),
+        "subscriptions": subs,
+    }
+
+
 # -------- Workout queries ----------------------------------------------------
 
 
@@ -804,11 +883,91 @@ query GetProfiles($clientUuid: String!, $userUuid: String!) {
     clientUuid
     firstName
     lastName
+    email
+    phone
+    address1
+    address2
+    emergencyName
+    emergencyPhone
     subscriptions {
       subscriptionUuid
       status
       active
       plan
+      __typename
+    }
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_LOCATIONS = """
+query GetLocations {
+  locations: getLocations(getLocationsInput: {}) {
+    uuid
+    name
+    isActive
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_CLASS_TYPES = """
+query GetClassTypes($date: String!) {
+  classTypes: getClassTypes(getClassTypesInput: {date: $date}) {
+    id
+    name
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_CLASS = """
+query GetClass($uuid: String!) {
+  calendarItem: getClass(getClassInput: {uuid: $uuid}) {
+    uuid
+    title
+    startDatetime
+    endDatetime
+    attendanceCap
+    spotsAvailable
+    location { name __typename }
+    mainCoach { firstName lastName __typename }
+    description
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_MEMBER_INFO = """
+query GetMemberInfo($clientUuid: String!, $userUuid: String!) {
+  profile: getProfile(getProfileInput: {clientUuid: $clientUuid, userUuid: $userUuid}) {
+    firstName
+    lastName
+    email
+    phone
+    address1
+    address2
+    emergencyName
+    emergencyPhone
+    subscriptions {
+      subscriptionUuid
+      status
+      active
+      plan
+      currentPeriodUsage {
+        limit
+        reservations
+        checkins
+        period
+        periodStart
+        periodEnd
+        __typename
+      }
       __typename
     }
     __typename
