@@ -43,8 +43,46 @@ provider = DomcityOAuthProvider(
 
 mcp = FastMCP("Domcity Planner", auth=provider)
 
-
 # --- Read tools ------------------------------------------------------------ #
+
+@mcp.tool
+async def get_locations() -> list[dict]:
+    """List all active gym locations (e.g. Kanaalweg 29C, Havenweg 6,
+    Overste den Oudenlaan 9). Each location includes its UUID, name, and
+    ``is_active`` flag."""
+    return await pushpress.get_locations()
+
+
+@mcp.tool
+async def get_class_types(date: str | None = None) -> list[dict]:
+    """List all available class types (Classic CrossFit, Functional CrossFit,
+    Olympic Weightlifting, Strength, Advanced CrossFit, Event, Hyrox, Boxes,
+    pre/post natal class).
+
+    Optional ``date`` parameter (ISO ``YYYY-MM-DD``) to filter by day.
+    """
+    return await pushpress.get_class_types(date)
+
+
+@mcp.tool
+async def get_class_details(uuid: str) -> dict:
+    """Get detailed information for a single class by its calendar item UUID.
+
+    Returns title, start/end times, attendance capacity, spots available,
+    location, instructor, and description.
+    """
+    return await pushpress.get_class_details(uuid)
+
+
+@mcp.tool
+async def get_member_info() -> dict:
+    """Return the logged-in member's profile: name, email, phone, address,
+    emergency contact (name + phone), and active subscriptions with their
+    session-credit usage for the current billing period.
+    """
+    return await pushpress.get_member_info()
+
+
 @mcp.tool
 async def get_schedule(start_date: str | None = None, end_date: str | None = None) -> list[dict]:
     """List CrossFit classes between two dates (inclusive, ISO ``YYYY-MM-DD``).
