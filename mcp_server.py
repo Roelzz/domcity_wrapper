@@ -363,6 +363,42 @@ async def get_automation_forecast() -> dict:
     }
 
 
+@mcp.tool
+async def get_workout_of_day(date: str, class_type_uid: str | None = None) -> list[dict]:
+    """Get the workout of the day for a class type on a given date (ISO
+    ``YYYY-MM-DD``).
+
+    Returns workout metadata plus the structured ``parts`` list. Each part is a
+    training segment (Warm-Up, A, B, METCON, ...) with its ``title``,
+    ``description`` (the actual movements, rounds, reps, time caps),
+    ``score_type`` (Time / Weight / Rounds / No Score), ``athletes_notes``,
+    ``coaches_notes``, ``score_count``, ``sets``, and ``default_reps``.
+
+    Use ``get_class_types()`` to find the ``id`` (class type UID) for each
+    class type. Common UIDs:
+        - Classic CrossFit:      4ebe07a3-b8f0-41ba-8e34-8d4cc2a09014
+        - Functional CrossFit:   8e5604a1-463b-4316-bce8-abdee466dabc
+        - Olympic Weightlifting: a2002767-a66a-4894-a76e-4fe19bb33b20
+        - Strength:              db209335-5cc6-4a9f-a611-64a10fe6b1b3
+        - Hyrox:                 84d97a3b-14b1-4efb-ae0c-6b7ba1b51438
+    """
+    return await pushpress.get_workout_of_day(date, class_type_uid)
+
+
+@mcp.tool
+async def get_workout_scores(workout_part_uid: str, workout_uid: str) -> dict:
+    """Get member scores for a workout part.
+
+    Returns ``{scores: [...], topScore: ... | null}`` where each score has
+    ``sets: [{weight, reps}]``.
+
+    **NOTE:** Returns empty ``scores`` arrays when no scores have been logged
+    in PushPress. The ``workoutPartUid`` is not exposed via the member API —
+    ``getWorkoutPart`` returns null for all known UIDs.
+    """
+    return await pushpress.get_workout_scores(workout_part_uid, workout_uid)
+
+
 # --- Write / action tools -------------------------------------------------- #
 @mcp.tool
 async def book_class(calendar_item_uuid: str) -> dict:

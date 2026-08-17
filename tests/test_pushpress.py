@@ -526,3 +526,199 @@ async def test_book_returns_already_reserved_without_calling_mutation():
     assert result.message == "already reserved"
     # Exactly two GraphQL calls: profile + reservations. The mutation was skipped.
     assert route.call_count == 2
+
+
+# ---- Workout tests -------------------------------------------------------- #
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_of_day_parses_response():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getWorkoutOfDay": [
+                        {
+                            "uid": "wod-1",
+                            "workoutUid": "wku-abc",
+                            "workoutState": "PUBLISHED",
+                            "workoutProgramGroupId": "g1",
+                            "workoutProgramTemplateId": "t1",
+                            "imageUrl": "https://img.example.com/wod.png",
+                            "videoUrlId": "vid-1",
+                            "day": 3,
+                            "parts": [
+                                {
+                                    "workoutPartUid": "part-1",
+                                    "title": "Warm-Up",
+                                    "description": "AMRAP 5\n- 6 Calorie Row",
+                                    "scoreType": "No Score",
+                                    "athletesNotes": None,
+                                    "coachesNotes": "Cue: keep lats engaged",
+                                    "scoreCount": 0,
+                                    "sets": 1,
+                                    "defaultReps": None,
+                                    "__typename": "WorkoutOfDayParts",
+                                },
+                                {
+                                    "workoutPartUid": "part-2",
+                                    "title": "B. METCON",
+                                    "description": "For Time\n1000/800m Row",
+                                    "scoreType": "Time",
+                                    "athletesNotes": "Score: Time",
+                                    "coachesNotes": "Goal: grind",
+                                    "scoreCount": 12,
+                                    "sets": 1,
+                                    "defaultReps": None,
+                                    "__typename": "WorkoutOfDayParts",
+                                },
+                            ],
+                            "__typename": "WorkoutOfDay",
+                        }
+                    ],
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_of_day("2026-08-13", "4ebe07a3-b8f0-41ba-8e34-8d4cc2a09014")
+    assert len(result) == 1
+    assert result[0]["uid"] == "wod-1"
+    assert result[0]["workoutUid"] == "wku-abc"
+    assert result[0]["workoutState"] == "PUBLISHED"
+    assert result[0]["imageUrl"] == "https://img.example.com/wod.png"
+    assert result[0]["day"] == 3
+    assert len(result[0]["parts"]) == 2
+    part0 = result[0]["parts"][0]
+    assert part0["workout_part_uid"] == "part-1"
+    assert part0["title"] == "Warm-Up"
+    assert part0["description"] == "AMRAP 5\n- 6 Calorie Row"
+    assert part0["score_type"] == "No Score"
+    assert part0["coaches_notes"] == "Cue: keep lats engaged"
+    assert part0["score_count"] == 0
+    assert part0["sets"] == 1
+    part1 = result[0]["parts"][1]
+    assert part1["title"] == "B. METCON"
+    assert part1["score_type"] == "Time"
+    assert part1["score_count"] == 12
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_of_day_parts_optional():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getWorkoutOfDay": [
+                        {
+                            "uid": "wod-2",
+                            "workoutUid": "wku-def",
+                            "workoutState": "PUBLISHED",
+                            "workoutProgramGroupId": None,
+                            "workoutProgramTemplateId": None,
+                            "imageUrl": None,
+                            "videoUrlId": None,
+                            "day": None,
+                            "__typename": "WorkoutOfDay",
+                        }
+                    ],
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_of_day("2026-08-13", "some-uid")
+    assert len(result) == 1
+    assert result[0]["parts"] == []
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_of_day_empty():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getWorkoutOfDay": [],
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_of_day("2026-08-13", "nonexistent-uid")
+    assert result == []
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_scores_returns_empty():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "workoutGetScores": {
+                        "scores": [],
+                        "topScore": None,
+                        "__typename": "WorkoutPartScore",
+                    },
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_scores("part-1", "wku-abc")
+    assert result["scores"] == []
+    assert result["topScore"] is None
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_workout_scores_with_data():
+    respx.post(pushpress.GRAPHQL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "workoutGetScores": {
+                        "scores": [
+                            {
+                                "id": "score-1",
+                                "date": "2026-08-13",
+                                "division": "RX",
+                                "sets": [{"weight": 95.0, "reps": 5}],
+                                "mine": True,
+                                "athleteUid": "usr_test",
+                                "athleteComment": "felt good",
+                                "workoutUid": "wku-abc",
+                                "workoutPartUid": "part-1",
+                                "__typename": "WorkoutLogScore",
+                            }
+                        ],
+                        "topScore": {
+                            "id": "score-2",
+                            "date": "2026-08-10",
+                            "division": "RX",
+                            "primaryScore": "12:34",
+                            "sets": [{"weight": 105.0, "reps": 5}],
+                            "athleteUid": "usr_test",
+                            "__typename": "WorkoutLogScore",
+                        },
+                        "__typename": "WorkoutPartScore",
+                    },
+                    "__typename": "Query",
+                }
+            },
+        )
+    )
+    result = await pushpress.get_workout_scores("part-1", "wku-abc")
+    assert len(result["scores"]) == 1
+    assert result["scores"][0]["sets"][0]["weight"] == 95.0
+    assert result["scores"][0]["sets"][0]["reps"] == 5
+    assert result["topScore"]["primaryScore"] == "12:34"
+    assert result["topScore"]["sets"][0]["weight"] == 105.0

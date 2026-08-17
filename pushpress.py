@@ -802,6 +802,77 @@ async def get_member_info() -> dict:
     }
 
 
+# -------- Workout queries ----------------------------------------------------
+
+
+async def get_workout_of_day(date: str, class_type_uid: str | None = None) -> list[dict]:
+    """Return the workout of the day for a class type on a given date.
+
+    Returns workout metadata plus the structured ``parts`` list. Each part is a
+    training segment (Warm-Up, A, B, METCON, ...) with its ``title``,
+    ``description`` (the actual movements, rounds, reps, time caps, etc.),
+    ``scoreType`` (Time / Weight / Rounds / No Score), ``athletesNotes``,
+    ``coachesNotes``, ``scoreCount``, ``sets``, and ``defaultReps``.
+
+    ``class_type_uid`` can be looked up via ``get_class_types()``. Common values:
+        Classic CrossFit:      4ebe07a3-b8f0-41ba-8e34-8d4cc2a09014
+        Functional CrossFit:   8e5604a1-463b-4316-bce8-abdee466dabc
+        Olympic Weightlifting: a2002767-a66a-4894-a76e-4fe19bb33b20
+        Strength:              db209335-5cc6-4a9f-a611-64a10fe6b1b3
+        Hyrox:                 84d97a3b-14b1-4efb-ae0c-6b7ba1b51438
+    """
+    data = await _gql(_QUERY_WORKOUT_OF_DAY, {"classTypeUid": class_type_uid, "date": date})
+    workouts = data.get("getWorkoutOfDay") or []
+    out = []
+    for w in workouts:
+        parts = []
+        for p in (w.get("parts") or []):
+            parts.append({
+                "workout_part_uid": p.get("workoutPartUid"),
+                "title": p.get("title"),
+                "description": p.get("description"),
+                "score_type": p.get("scoreType"),
+                "athletes_notes": p.get("athletesNotes"),
+                "coaches_notes": p.get("coachesNotes"),
+                "score_count": p.get("scoreCount"),
+                "sets": p.get("sets"),
+                "default_reps": p.get("defaultReps"),
+            })
+        out.append({
+            "uid": w.get("uid"),
+            "workoutUid": w.get("workoutUid"),
+            "workoutState": w.get("workoutState"),
+            "workoutProgramGroupId": w.get("workoutProgramGroupId"),
+            "workoutProgramTemplateId": w.get("workoutProgramTemplateId"),
+            "imageUrl": w.get("imageUrl"),
+            "videoUrlId": w.get("videoUrlId"),
+            "day": w.get("day"),
+            "parts": parts,
+        })
+    return out
+
+
+async def get_workout_scores(workout_part_uid: str, workout_uid: str) -> dict:
+    """Return member scores for a workout part.
+
+    Returns ``{scores: [...], topScore: ... | null}`` where each score has
+    ``sets: [{weight, reps}]``.
+
+    NOTE: Returns empty arrays when no scores have been logged in PushPress.
+    The workoutPartUid is not exposed via the member API — ``getWorkoutPart``
+    returns null for all known UIDs.
+    """
+    data = await _gql(_QUERY_WORKOUT_SCORES, {
+        "workoutPartUid": workout_part_uid,
+        "workoutUid": workout_uid,
+    })
+    result = data.get("workoutGetScores") or {}
+    return {
+        "scores": result.get("scores") or [],
+        "topScore": result.get("topScore"),
+    }
+
+
 # -------- GraphQL queries ----------------------------------------------------
 
 _QUERY_PROFILE = """
@@ -985,6 +1056,67 @@ _MUTATION_CANCEL = """
 mutation CancelReservation($reservationId: String!) {
   cancelReservation(cancelReservationInput: {reservationId: $reservationId}) {
     uuid
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_WORKOUT_OF_DAY = """
+query GetWorkoutOfDay($classTypeUid: String!, $date: String!) {
+  getWorkoutOfDay(getWorkoutOfDayInput: {classTypeUid: $classTypeUid, date: $date}) {
+    uid
+    workoutUid
+    workoutState
+    workoutProgramGroupId
+    workoutProgramTemplateId
+    imageUrl
+    videoUrlId
+    day
+    parts {
+      workoutPartUid
+      title
+      description
+      scoreType
+      athletesNotes
+      coachesNotes
+      scoreCount
+      sets
+      defaultReps
+      __typename
+    }
+    __typename
+  }
+  __typename
+}
+"""
+
+_QUERY_WORKOUT_SCORES = """
+query GetWorkoutScores($workoutPartUid: String!, $workoutUid: String) {
+  workoutGetScores(workoutGetScoresInput: {workoutPartUid: $workoutPartUid, workoutUid: $workoutUid}) {
+    scores {
+      id
+      date
+      division
+      sets { weight reps }
+      mine
+      athleteUid
+      athleteComment
+      workoutUid
+      workoutPartUid
+      __typename
+    }
+    topScore {
+      id
+      date
+      division
+      primaryScore
+      secondaryScore
+      sets { weight reps }
+      athleteUid
+      athleteComment
+      __typename
+    }
     __typename
   }
   __typename
